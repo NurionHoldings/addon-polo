@@ -386,7 +386,7 @@ class App:
         return self.redirect(start,'/reconcile')
     def redirect(self,start,path):start('303 See Other',[('Location',path),('Cache-Control','no-store')]);return [b'']
     def csv_response(self,start,rows,filename):
-        safe_rows=[[("'"+v) if isinstance(v,str) and v[:1] in ('=','+','-','@','\\t','\\r') else v for v in row] for row in rows]
+        safe_rows=[[("'"+v) if isinstance(v,str) and v[:1] in ('=','+','-','@','\t','\r') else v for v in row] for row in rows]
         buf=io.StringIO(newline='');w=csv.writer(buf);w.writerows(safe_rows);data='\ufeff'+buf.getvalue();return self.respond(start,'200 OK',data,[('Content-Type','text/csv; charset=utf-8'),('Content-Disposition',f'attachment; filename="{filename}"')])
     def get_csv(self,path,user,start):
         if path=='/payouts.csv': self.require(user,'admin','finance')

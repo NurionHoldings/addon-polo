@@ -144,6 +144,17 @@ class OperationalFlowTest(unittest.TestCase):
         with app.conn() as c:
             self.assertIsNone(c.execute("SELECT 1 FROM sale_events WHERE event_key='X'").fetchone())
 
+    def test_csv_exports_escape_spreadsheet_formulas(self):
+        response = {}
+        def start(status, headers): response['status'], response['headers'] = status, headers
+        result = b''.join(app.application.csv_response(
+            start, [['=1+1', '+cmd', '-cmd', '@cmd', '\tcmd', '\rcmd', 'safe']], 'test.csv'
+        )).decode('utf-8-sig')
+        self.assertTrue(response['status'].startswith('200'))
+        for formula in ('=1+1', '+cmd', '-cmd', '@cmd', '\tcmd', '\rcmd'):
+            self.assertIn("'" + formula, result)
+        self.assertIn('safe', result)
+
 
 if __name__ == '__main__':
     unittest.main()
