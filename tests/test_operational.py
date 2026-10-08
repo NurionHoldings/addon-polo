@@ -138,8 +138,13 @@ class OperationalFlowTest(unittest.TestCase):
     def test_public_home_and_admin_console_access_boundary(self):
         home=self.request('/')
         self.assertTrue(home['status'].startswith('200'))
-        self.assertIn('온빌딩 | 입점업체 매출·수수료 관리',home['body'])
+        self.assertIn('누리온 세일즈허브 | 아세아홀딩스',home['body'])
+        self.assertIn('아세아홀딩스',home['body'])
+        self.assertIn('data-motion-toggle',home['body'])
         self.assertIn('관리자 전용 페이지',home['body'])
+        self.assertIn('관리자 운영실',home['body'])
+        self.assertIn('실무자 · 정산 담당',home['body'])
+        self.assertIn('href="/login?next=/dashboard"',home['body'])
 
         anonymous=self.request('/admin')
         self.assertTrue(anonymous['status'].startswith('303'))
@@ -149,12 +154,21 @@ class OperationalFlowTest(unittest.TestCase):
         admin=self.request('/admin',cookie=admin_cookie)
         self.assertTrue(admin['status'].startswith('200'))
         self.assertIn('관리자 전용 운영실',admin['body'])
+        self.assertIn('아세아홀딩스',admin['body'])
+        self.assertIn('누리온 세일즈허브',admin['body'])
+        self.assertIn('data-motion-toggle',admin['body'])
         self.assertIn('감사 이력 보기',admin['body'])
 
         finance_cookie=self.login('finance','LongSecurePass789!','/admin')
         denied=self.request('/admin',cookie=finance_cookie)
         self.assertTrue(denied['status'].startswith('403'))
         self.assertIn('권한이 없습니다',denied['body'])
+
+    def test_brand_logo_is_public_svg(self):
+        logo=self.request('/nurion-logo.svg')
+        self.assertTrue(logo['status'].startswith('200'))
+        self.assertEqual(dict(logo['headers'])['Content-Type'],'image/svg+xml; charset=utf-8')
+        self.assertIn('<svg',logo['body'])
 
     def test_financial_mutations_require_csrf(self):
         cookie = self.login('owner', 'LongSecurePass123!')
