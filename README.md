@@ -47,6 +47,12 @@
 6. 월별 거래 확인 후 정산 스냅샷을 생성하고 수납 사실을 기록합니다.
 7. 정산 담당자 계정은 python app.py create-user staff --role finance로 만들고, 업체 계정은 업체 등록 후 python app.py create-user vendor --role tenant --tenant-id 업체ID로 발급합니다.
 
+## 공개 홈과 관리자 전용 화면
+
+공개 안내 홈은 `public/index.html`에 있습니다. 로그인하면 운영자는 `/admin`의 관리자 전용 운영실에서 업체·채널 등록, 정산 차이, 미수 명세와 최근 변경 이력을 확인할 수 있습니다. `/admin` 권한은 화면 버튼 숨김이 아니라 서버에서 `admin` 역할을 확인합니다.
+
+Netlify는 공개 홈과 요청 프록시로 사용합니다. 현재 원장 앱은 Python WSGI와 SQLite이므로 영구 저장소가 있는 컨테이너 서버도 함께 필요합니다. 배포 변수 설정과 검증 순서는 [Netlify 배포 준비](docs/netlify-deployment.md)를 확인하세요. Python 운영 서버 주소가 설정되기 전에는 로그인/관리자 요청을 공개하지 않습니다.
+
 ## CSV 형식
 
 매출 이벤트 필수 헤더:

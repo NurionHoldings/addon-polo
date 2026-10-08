@@ -67,15 +67,29 @@ def create_user(username,password,role='admin',tenant_id=None):
 def esc(v): return html.escape(str(v if v is not None else ''),quote=True)
 def won(v): return f'{int(v or 0):,}원'
 def page(title, body, user=None, active='dashboard', csrf=''):
-    nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in [('dashboard','대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널')])
+    menus={
+        'admin':[('admin','관리자 홈'),('dashboard','운영 대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널'),('audit','감사 이력')],
+        'finance':[('dashboard','대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비')],
+        'tenant':[('dashboard','내 현황'),('sales','내 매출'),('settlements','수수료 명세'),('arkaon','아르카온 분석')],
+    }
+    links=menus.get(user['role'],[]) if user else []
+    nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in links)
     who=f'{esc(user["username"])} · {esc(user["role"])}' if user else '로그인 필요'
     logout=f'<form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(csrf)}"><button class="link">로그아웃</button></form>' if user else ''
     return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} | 온빌딩</title><style>
 :root{{--navy:#13223d;--blue:#4969e8;--bg:#f4f6fa;--line:#e5e9f0;--muted:#78849a;--text:#202b3e;--green:#13865f;--red:#bd454d}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:14px/1.5 system-ui,"Noto Sans KR",sans-serif;color:var(--text)}}header{{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 max(20px,calc((100vw - 1320px)/2));position:sticky;top:0;z-index:2}}.brand{{font-weight:850;color:var(--navy);font-size:18px;text-decoration:none}}.user{{display:flex;gap:16px;align-items:center;color:var(--muted);font-size:12px}}.link{{background:none;border:0;color:var(--blue);cursor:pointer}}nav{{display:flex;gap:4px;overflow:auto;padding:12px max(14px,calc((100vw - 1320px)/2));background:var(--navy)}}nav a{{color:#c5d0e1;text-decoration:none;padding:8px 12px;border-radius:8px;white-space:nowrap;font-size:12px}}nav a.active,nav a:hover{{background:#263a5b;color:white}}main{{max-width:1320px;margin:26px auto;padding:0 18px 55px}}h1{{font-size:24px;letter-spacing:-.5px;margin:0 0 4px}}h2{{font-size:16px;margin:0 0 14px}}.sub{{color:var(--muted);font-size:12px;margin-bottom:20px}}.row{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}}.card,.panel{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 2px 8px #1b31540b}}.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}}.metric small{{color:var(--muted)}}.metric strong{{display:block;font-size:23px;margin-top:8px}}.grid{{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;margin-bottom:15px}}.btn{{display:inline-block;border:1px solid #dce2ec;background:white;color:#33425b;text-decoration:none;border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:650;font-size:12px}}.btn.primary{{background:var(--blue);color:#fff;border-color:var(--blue)}}input,select,textarea{{font:inherit;border:1px solid #dbe1eb;border-radius:7px;padding:9px 10px;background:#fff;max-width:100%}}label{{display:block;font-size:11px;font-weight:700;color:#637086;margin:10px 0 5px}}form.inline{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.tablewrap{{overflow:auto}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th{{background:#f8f9fb;color:#768298;text-align:left;font-size:10px;padding:10px;border-bottom:1px solid var(--line)}}td{{font-size:11px;padding:10px;border-bottom:1px solid #edf0f4}}.right{{text-align:right}}.badge{{display:inline-block;background:#e9f5ef;color:#137d5c;padding:3px 8px;border-radius:20px;font-size:10px}}.warn{{background:#fff4df;color:#a96c0e}}.bad{{background:#ffeded;color:#b33e48}}.note{{background:#fff8e8;color:#805d19;border-radius:8px;padding:11px 13px;font-size:11px;margin-top:12px}}.error{{background:#fff0f0;color:#a4303b;padding:10px;border-radius:8px;margin:12px 0;font-size:12px}}.success{{background:#eaf7f1;color:#176c52;padding:10px;border-radius:8px;margin:12px 0;font-size:12px}}.formgrid{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 12px}}.small{{font-size:10px;color:var(--muted)}}.spacer{{height:14px}}.login{{max-width:440px;margin:80px auto}}.danger{{color:var(--red)}}@media(max-width:800px){{.cards{{grid-template-columns:repeat(2,1fr)}}.grid{{grid-template-columns:1fr}}.formgrid{{grid-template-columns:1fr 1fr}}main{{margin-top:18px}}}}@media(max-width:520px){{.cards{{grid-template-columns:1fr 1fr;gap:8px}}.metric strong{{font-size:17px}}header{{padding:0 14px}}.formgrid{{grid-template-columns:1fr}}}}
-</style></head><body><header><a class="brand" href="/dashboard">온빌딩 · SALES CONTROL</a><div class="user">{who}{logout}</div></header><nav>{nav}</nav><main>{body}</main></body></html>'''
+.admin-hero{{background:linear-gradient(120deg,#12213b,#203969 70%,#3e55a5);border-radius:18px;padding:30px;color:white;display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:18px}}.admin-hero h1{{font-size:29px;margin:8px 0}}.admin-hero p{{margin:0;color:#d5def0}}.eyebrow{{font-size:10px;letter-spacing:1.5px;color:#a8bbff;font-weight:800}}.btn.light{{background:white;color:#24375d;border-color:white}}.admin-cards{{grid-template-columns:repeat(5,1fr)}}.admin-cards .metric{{padding:16px}}.admin-cards .metric strong{{font-size:20px}}.admin-actions{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}.action-card{{border:1px solid var(--line);border-radius:10px;padding:16px;text-decoration:none;color:var(--text);display:flex;flex-direction:column;min-height:140px;transition:transform .18s,border-color .18s}}.action-card:hover{{transform:translateY(-2px);border-color:#8799e8}}.action-card b{{font-size:14px}}.action-card span{{font-size:11px;color:var(--muted);margin:8px 0 14px}}.action-card em{{font-size:11px;font-style:normal;color:var(--blue);font-weight:700;margin-top:auto}}.checklist{{list-style:none;padding:0;margin:0}}.checklist li{{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #edf0f4}}.checklist li:last-child{{border:0}}.checklist li>span{{font-size:12px;font-weight:800;color:var(--blue)}}.checklist b,.checklist small{{display:block}}.checklist small{{font-size:11px;color:var(--muted);margin-top:4px}}@media(max-width:900px){{.admin-cards{{grid-template-columns:repeat(3,1fr)}}.admin-actions{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:560px){{.admin-hero{{align-items:flex-start;flex-direction:column;padding:22px}}.admin-cards{{grid-template-columns:repeat(2,1fr)}}.admin-actions{{grid-template-columns:1fr 1fr}}.action-card{{min-height:160px;padding:13px}}}}
+</style></head><body><header><a class="brand" href="/">온빌딩 · SALES CONTROL</a><div class="user">{who}{logout}</div></header>{f'<nav>{nav}</nav>' if nav else ''}<main>{body}</main></body></html>'''
 
-def login_page(message='', csrf=''):
-    return page('로그인',f'''<section class="login panel"><h1>운영자 로그인</h1><p class="sub">매출·정산 자료는 권한이 있는 사용자만 볼 수 있습니다.</p>{message}<form method="post" action="/login"><input type="hidden" name="csrf" value="{esc(csrf)}"><label>아이디</label><input name="username" autocomplete="username" required style="width:100%"><label>비밀번호</label><input name="password" type="password" autocomplete="current-password" required style="width:100%"><div class="spacer"></div><button class="btn primary" style="width:100%">로그인</button></form></section>''')
+def public_home_page():
+    try:
+        with open(os.path.join(ROOT,'public','index.html'),encoding='utf-8') as f:return f.read()
+    except OSError:
+        return '<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>온빌딩</title><main><h1>온빌딩 매출·수수료 관리</h1><a href="/login">운영자 로그인</a></main></html>'
+
+def login_page(message='', csrf='', next_path='/dashboard'):
+    safe_next='/admin' if next_path=='/admin' else '/dashboard'
+    return page('로그인',f'''<section class="login panel"><h1>운영자 로그인</h1><p class="sub">매출·정산 자료는 권한이 있는 사용자만 볼 수 있습니다.</p>{message}<form method="post" action="/login"><input type="hidden" name="csrf" value="{esc(csrf)}"><input type="hidden" name="next" value="{safe_next}"><label>아이디</label><input name="username" autocomplete="username" required style="width:100%"><label>비밀번호</label><input name="password" type="password" autocomplete="current-password" required style="width:100%"><div class="spacer"></div><button class="btn primary" style="width:100%">로그인</button></form></section>''')
 
 class App:
     def __init__(self): init_db()
@@ -85,6 +99,7 @@ class App:
         session,user,csrf,new_cookie=self.session_for(environ)
         try:
             if path=='/health': return self.respond(start_response,'200 OK','ok', [('Content-Type','text/plain; charset=utf-8')],new_cookie)
+            if path=='/' and method=='GET': return self.html(start_response,public_home_page(),'200 OK',new_cookie=new_cookie)
             if path=='/login' and method=='POST':
                 data=self.form(environ);self.check_csrf(data,csrf)
                 with conn() as c:
@@ -98,13 +113,18 @@ class App:
                         return self.html(start_response,login_page('<div class="error">아이디 또는 비밀번호를 확인해 주세요.</div>',csrf),'200 OK',new_cookie=new_cookie)
                     c.execute('DELETE FROM login_failures WHERE username_key=?',(username_key,))
                     raw=secrets.token_urlsafe(32);c.execute('DELETE FROM sessions WHERE token_hash=?',(session,));c.execute('INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES(?,?,?,?)',(hashlib.sha256(raw.encode()).hexdigest(),u['id'],secrets.token_urlsafe(24),int(time.time())+SESSION_SECONDS));audit(c,u['id'],'auth.login','user',u['id'])
-                    start_response('303 See Other',[('Location','/dashboard'),('Set-Cookie',self.cookie(raw)) ,('Cache-Control','no-store')]);return [b'']
+                    destination='/admin' if data.get('next')=='/admin' and u['role']=='admin' else '/dashboard'
+                    start_response('303 See Other',[('Location',destination),('Set-Cookie',self.cookie(raw)) ,('Cache-Control','no-store')]);return [b'']
             if path=='/logout' and method=='POST':
                 self.check_csrf(self.form(environ),csrf)
                 with conn() as c:c.execute('DELETE FROM sessions WHERE token_hash=?',(session,))
                 start_response('303 See Other',[('Location','/login'),('Set-Cookie',self.cookie('',max_age=0)),('Cache-Control','no-store')]);return [b'']
             if not user:
-                if path=='/login': return self.html(start_response,login_page(csrf=csrf),'200 OK',new_cookie=new_cookie)
+                if path=='/login':
+                    requested=parse_qs(environ.get('QUERY_STRING','')).get('next',['/dashboard'])[0]
+                    return self.html(start_response,login_page(csrf=csrf,next_path=requested),'200 OK',new_cookie=new_cookie)
+                if path=='/admin':
+                    start_response('303 See Other',[('Location','/login?next=/admin'),('Cache-Control','no-store')]);return [b'']
                 start_response('303 See Other',[('Location','/login'),('Cache-Control','no-store')]);return [b'']
             if method=='POST':
                 data=self.form(environ)
@@ -113,8 +133,7 @@ class App:
             if method!='GET': return self.error(start_response,'405 Method Not Allowed','지원하지 않는 요청입니다.',user,csrf)
             if path.endswith('.csv'):
                 return self.get_csv(path,user,start_response)
-            if path=='/':path='/dashboard'
-            routes={'/dashboard':self.dashboard,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
+            routes={'/admin':self.admin_console,'/dashboard':self.dashboard,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
             if path not in routes:return self.error(start_response,'404 Not Found','요청한 화면을 찾지 못했습니다.',user,csrf)
             if path=='/settlements':
                 selected=parse_qs(environ.get('QUERY_STRING','')).get('period',[''])[0]
@@ -186,6 +205,31 @@ class App:
         rows=''.join(self.sale_row(x) for x in recent) or '<tr><td colspan="8">거래 기록이 없습니다. 매출을 등록하거나 CSV를 가져오세요.</td></tr>'
         body=f'<div class="row"><div><h1>통합 매출 대시보드</h1><div class="sub">주문 원장, 수수료와 입금 대사 현황</div></div><a class="btn primary" href="/sales">매출 원장 열기</a></div><div class="cards">{blocks}</div><div class="grid"><section class="panel"><h2>미대사 정산</h2>{self.recon_preview(user)}</section><section class="panel"><h2>정산 운영 상태</h2><p class="small">수수료율은 업체 계약 설정을 따릅니다. 월 마감 시점에 해당 월 정산 스냅샷을 생성하세요.</p><a class="btn" href="/settlements">정산 생성·조회</a><div class="note">원본 거래는 수정·삭제하지 않습니다. 환불은 별도 음수 거래로 등록되어 기존 매출과 이력이 보존됩니다.</div></section></div><section class="panel"><h2>최근 거래</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows}</tbody></table></div></section>'
         return page('대시보드',body,user,'dashboard',csrf)
+    def admin_console(self,user,csrf):
+        self.require(user,'admin')
+        period=today_kst().strftime('%Y-%m')
+        first=dt.date.fromisoformat(period+'-01');next_month=(first.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+        with conn() as c:
+            tenants=c.execute('SELECT COUNT(*) n FROM tenants WHERE active=1').fetchone()['n']
+            channels=c.execute('SELECT COUNT(*) n FROM channels WHERE active=1').fetchone()['n']
+            sales=c.execute('SELECT COUNT(*) n,COALESCE(SUM(gross_amount),0) amount FROM sale_events WHERE occurred_on>=? AND occurred_on<?',(first.isoformat(),next_month.isoformat())).fetchone()
+            payout=c.execute('SELECT COUNT(*) n,COALESCE(SUM(MAX(expected_amount-received_amount,0)),0) amount FROM payout_records WHERE expected_amount<>received_amount').fetchone()
+            statements=c.execute('SELECT COUNT(*) n,COALESCE(SUM(total_amount),0) amount FROM statements WHERE status="issued"').fetchone()
+            recent=c.execute('SELECT a.created_at,u.username,a.action,a.object_type,a.object_id FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 6').fetchall()
+        cards=''.join(f'<article class="card metric"><small>{label}</small><strong>{value}</strong><span class="small">{detail}</span></article>' for label,value,detail in [
+            ('등록 입점업체',f'{tenants:,}개','활성 상태'),
+            ('운영 판매채널',f'{channels:,}개','POS·온라인·라이브 등'),
+            (f'{period} 원장 거래',f'{sales["n"]:,}건',f'거래 순액 {won(sales["amount"])}'),
+            ('미대사 정산',f'{payout["n"]:,}건',f'차액 합계 {won(payout["amount"])}'),
+            ('미수 수수료 명세',f'{statements["n"]:,}건',f'발행액 {won(statements["amount"])}'),
+        ])
+        recent_html=''.join(f'<tr><td>{esc(r["created_at"])}</td><td>{esc(r["username"] or "시스템")}</td><td>{esc(r["action"])}</td><td>{esc(r["object_type"])} #{esc(r["object_id"])}</td></tr>' for r in recent) or '<tr><td colspan="4">아직 기록된 변경이 없습니다.</td></tr>'
+        body=f'''<section class="admin-hero"><div><span class="eyebrow">OWNER CONSOLE · {esc(period)}</span><h1>관리자 전용 운영실</h1><p>입점업체, 판매 채널, 매출 원장, 정산 차이를 한곳에서 확인합니다.</p></div><a class="btn light" href="/audit">감사 이력 보기</a></section>
+        <div class="cards admin-cards">{cards}</div>
+        <section class="panel"><div class="row"><div><h2>바로가기</h2><div class="sub">운영 시작과 월 마감에 필요한 관리자 기능입니다.</div></div></div><div class="admin-actions"><a class="action-card" href="/tenants"><b>입점업체 관리</b><span>계약 수수료율과 과세 구분을 등록합니다.</span><em>업체 목록 열기 →</em></a><a class="action-card" href="/channels"><b>판매 채널 관리</b><span>POS, 라이브방송, 온라인 채널을 등록합니다.</span><em>채널 설정 열기 →</em></a><a class="action-card" href="/connectors"><b>외부 연동 준비</b><span>업체별 자료 규격과 협의할 항목을 확인합니다.</span><em>연동 준비 열기 →</em></a><a class="action-card" href="/settlements"><b>수수료 월 마감</b><span>월별 명세를 만들고 수납 상태를 기록합니다.</span><em>정산 화면 열기 →</em></a></div></section>
+        <div class="grid admin-grid"><section class="panel"><h2>관리자 점검 순서</h2><ol class="checklist"><li><span>01</span><div><b>입점 계약 등록</b><small>수수료율·과세 구분을 계약서와 맞춰 입력합니다.</small></div></li><li><span>02</span><div><b>판매 채널 준비</b><small>POS와 온라인·라이브 채널별 담당자와 자료 수집 방법을 확인합니다.</small></div></li><li><span>03</span><div><b>자료 대사 후 월 마감</b><small>누락·중복과 입금 차이를 확인한 뒤 수수료 명세를 생성합니다.</small></div></li></ol></section><section class="panel"><h2>최근 관리자 변경</h2><div class="tablewrap"><table><thead><tr><th>일시</th><th>사용자</th><th>작업</th><th>대상</th></tr></thead><tbody>{recent_html}</tbody></table></div><p class="small">관리자 변경은 감사 이력에 남습니다.</p></section></div>
+        <div class="note">이 페이지는 관리자 계정만 볼 수 있습니다. 정산 차이와 발행액은 현재 원장에 등록된 자료 기준이며, 자동 송금이나 자료의 자동 수정은 수행하지 않습니다.</div>'''
+        return page('관리자 전용',body,user,'admin',csrf)
     def sale_head(self):return '<thead><tr><th>발생일</th><th>주문번호</th><th>업체</th><th>채널</th><th>유형</th><th>결제액</th><th>세액</th><th>결제수단</th></tr></thead>'
     def sale_row(self,r):return f'<tr><td>{esc(r["occurred_on"])}</td><td>{esc(r["order_id"])}</td><td>{esc(r["tenant"])}</td><td>{esc(r["channel"])}</td><td>{esc(r["event_type"])}</td><td class="right">{won(r["gross_amount"])}</td><td class="right">{won(r["tax_amount"])}</td><td>{esc(r["payment_method"])}</td></tr>'
     def recon_preview(self,user):

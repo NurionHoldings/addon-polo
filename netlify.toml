@@ -1,0 +1,13 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[dev]
+  command = "python app.py serve --host 127.0.0.1 --port 8000"
+  targetPort = 8000
+  port = 8888
+  framework = "#custom"
+  publish = "public"

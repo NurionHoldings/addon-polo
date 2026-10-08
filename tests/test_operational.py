@@ -25,12 +25,15 @@ class OperationalFlowTest(unittest.TestCase):
                 ('공용 POS', 'POS', app.now_iso()),
             ).lastrowid
         app.create_user('vendor', 'LongSecurePass456!', 'tenant', cls.tenant_id)
+        app.create_user('finance', 'LongSecurePass789!', 'finance')
         cls.wsgi = app.application
 
     def request(self, path, method='GET', data=None, cookie=''):
+        parsed = urllib.parse.urlsplit(path)
         body = urllib.parse.urlencode(data or {}).encode()
         environ = {
-            'PATH_INFO': path,
+            'PATH_INFO': parsed.path,
+            'QUERY_STRING': parsed.query,
             'REQUEST_METHOD': method,
             'CONTENT_LENGTH': str(len(body)),
             'CONTENT_TYPE': 'application/x-www-form-urlencoded',
@@ -44,12 +47,13 @@ class OperationalFlowTest(unittest.TestCase):
         result['body'] = content
         return result
 
-    def login(self, username, password):
-        first = self.request('/login')
+    def login(self, username, password, next_path='/dashboard'):
+        first = self.request('/login?next=' + urllib.parse.quote(next_path, safe='/'))
         csrf = re.search(r'name="csrf" value="([^"]+)', first['body']).group(1)
         anonymous_cookie = next(v for k, v in first['headers'] if k == 'Set-Cookie').split(';')[0]
         logged = self.request('/login', 'POST', {
             'csrf': csrf, 'username': username, 'password': password,
+            'next': next_path,
         }, anonymous_cookie)
         cookie = next(v for k, v in logged['headers'] if k == 'Set-Cookie').split(';')[0]
         return cookie
@@ -130,6 +134,27 @@ class OperationalFlowTest(unittest.TestCase):
         self.assertTrue(response['status'].startswith('200'))
         self.assertIn('공용 POS / VAN',response['body'])
         self.assertIn('공식 문서',response['body'])
+
+    def test_public_home_and_admin_console_access_boundary(self):
+        home=self.request('/')
+        self.assertTrue(home['status'].startswith('200'))
+        self.assertIn('온빌딩 | 입점업체 매출·수수료 관리',home['body'])
+        self.assertIn('관리자 전용 페이지',home['body'])
+
+        anonymous=self.request('/admin')
+        self.assertTrue(anonymous['status'].startswith('303'))
+        self.assertIn('/login?next=/admin',dict(anonymous['headers'])['Location'])
+
+        admin_cookie=self.login('owner','LongSecurePass123!','/admin')
+        admin=self.request('/admin',cookie=admin_cookie)
+        self.assertTrue(admin['status'].startswith('200'))
+        self.assertIn('관리자 전용 운영실',admin['body'])
+        self.assertIn('감사 이력 보기',admin['body'])
+
+        finance_cookie=self.login('finance','LongSecurePass789!','/admin')
+        denied=self.request('/admin',cookie=finance_cookie)
+        self.assertTrue(denied['status'].startswith('403'))
+        self.assertIn('권한이 없습니다',denied['body'])
 
     def test_financial_mutations_require_csrf(self):
         cookie = self.login('owner', 'LongSecurePass123!')

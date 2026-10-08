@@ -3,6 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_DIR=/data DATABASE_PATH=/d
 WORKDIR /app
 COPY app.py /app/app.py
 COPY connectors/ /app/connectors/
+COPY public/ /app/public/
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt && mkdir -p /data
 EXPOSE 8000
