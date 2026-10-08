@@ -217,5 +217,51 @@ class OperationalFlowTest(unittest.TestCase):
         self.assertIn('safe', result)
 
 
+    def test_sales_reports_totals_and_downloads(self):
+        with app.conn() as c:
+            tenant=c.execute('SELECT * FROM tenants WHERE id=?',(self.tenant_id,)).fetchone()
+            channel=c.execute('SELECT * FROM channels WHERE id=?',(self.channel_id,)).fetchone()
+            app.App.insert_event(c,tenant,channel,'REPORT-SALE','REPORT-ORDER','sale','2026-10-03','보고서 사과',33000,0,3000,'card','',None,1,3)
+            app.App.insert_event(c,tenant,channel,'REPORT-REFUND','REPORT-ORDER','refund','2026-10-03','보고서 사과',-11000,0,-1000,'card','',None,1,-1)
+
+        owner_cookie=self.login('owner','LongSecurePass123!')
+        path='/reports?start=2026-10-03&end=2026-10-03&tenant_id='+str(self.tenant_id)
+        report=self.request(path,cookie=owner_cookie)
+        self.assertTrue(report['status'].startswith('200'))
+        for label in ('품목별 판매현황','일자별 매출총계','월간 매출합계','인쇄 · PDF 저장','순매출 · 결제 기준'):
+            self.assertIn(label,report['body'])
+        self.assertIn('22,000원',report['body'])
+        self.assertIn('순수량',report['body'])
+        self.assertIn('href="/reports/items.csv?',report['body'])
+
+        item=self.request('/reports/items.csv?start=2026-10-03&end=2026-10-03&tenant_id='+str(self.tenant_id),cookie=owner_cookie)
+        self.assertTrue(item['status'].startswith('200'))
+        self.assertIn('attachment; filename="item-sales-report.csv"',dict(item['headers'])['Content-Disposition'])
+        item_csv=item['body'].lstrip('\ufeff')
+        self.assertIn('보고서 사과',item_csv)
+        self.assertIn('3,1,2,33000,11000,0,22000',item_csv)
+        daily=self.request('/reports/daily.csv?start=2026-10-03&end=2026-10-03&tenant_id='+str(self.tenant_id),cookie=owner_cookie)
+        monthly=self.request('/reports/monthly.csv?start=2026-10-03&end=2026-10-03&tenant_id='+str(self.tenant_id),cookie=owner_cookie)
+        self.assertIn('2026-10-03',daily['body'])
+        self.assertIn('2026-10,1,1,3,1,2,33000,11000,0,22000',monthly['body'].lstrip('\ufeff'))
+
+    def test_tenant_report_filters_and_exports_are_scoped(self):
+        with app.conn() as c:
+            other_id=c.execute("INSERT INTO tenants(name,fee_rate,vat_mode,created_at) VALUES(?,?,?,?)",('보고서 격리 업체','10.00','taxable',app.now_iso())).lastrowid
+            tenant=c.execute('SELECT * FROM tenants WHERE id=?',(other_id,)).fetchone()
+            channel=c.execute('SELECT * FROM channels WHERE id=?',(self.channel_id,)).fetchone()
+            app.App.insert_event(c,tenant,channel,'REPORT-FOREIGN','FOREIGN-REPORT','sale','2026-10-04','비공개 품목',987654,0,0,'card','',None,1,1)
+        vendor_cookie=self.login('vendor','LongSecurePass456!')
+        query='/reports?start=2026-10-04&end=2026-10-04&tenant_id='+str(other_id)
+        report=self.request(query,cookie=vendor_cookie)
+        self.assertTrue(report['status'].startswith('200'))
+        self.assertNotIn('비공개 품목',report['body'])
+        self.assertNotIn('보고서 격리 업체',report['body'])
+        export=self.request('/reports/items.csv?start=2026-10-04&end=2026-10-04&tenant_id='+str(other_id),cookie=vendor_cookie)
+        self.assertTrue(export['status'].startswith('200'))
+        self.assertNotIn('비공개 품목',export['body'])
+        self.assertNotIn('987654',export['body'])
+
+
 if __name__ == '__main__':
     unittest.main()
