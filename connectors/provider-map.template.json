@@ -1,0 +1,47 @@
+{
+  "schema_version": "addon-polo.provider-map/v1",
+  "provider_id": "FILL_AFTER_PARTNER_AGREEMENT",
+  "connector_id": "venue-pos | commerce-live | pg-card-settlement | bank-deposit",
+  "approved_source_document": "official document URL or file reference",
+  "sandbox_account_reference": "secret-manager key only; never paste credentials here",
+  "transport": "csv | rest-pull | webhook",
+  "credential_env_names": [],
+  "sales_field_map": {
+    "event_id": "provider.path.to.unique_event_id",
+    "order_id": "provider.path.to.order_id",
+    "event_type": "provider.path.to.status",
+    "date": "provider.path.to.transaction_date",
+    "amount": "provider.path.to.actual_paid_amount",
+    "tax_amount": "provider.path.to.product_tax_amount",
+    "discount": "provider.path.to.discount_amount",
+    "product": "provider.path.to.product_name",
+    "payment_method": "provider.path.to.payment_method",
+    "settlement_ref": "provider.path.to.settlement_id"
+  },
+  "status_map": {
+    "PROVIDER_PAID_STATUS": "sale",
+    "PROVIDER_REFUND_STATUS": "refund",
+    "PROVIDER_CANCEL_STATUS": "cancel"
+  },
+  "settlement_field_map": {
+    "settlement_ref": "provider.path.to.settlement_id",
+    "settlement_date": "provider.path.to.settlement_date",
+    "expected_amount": "provider.path.to.net_expected_amount",
+    "received_amount": "bank.path.to.deposit_amount",
+    "provider_fee": "provider.path.to.fee_amount",
+    "bank_ref": "bank.path.to.transaction_id"
+  },
+  "sync_policy": {
+    "initial_backfill_start": "YYYY-MM-DD",
+    "incremental_cursor_field": "provider_cursor_or_updated_at",
+    "overlap_window_minutes": 15,
+    "retry_max_attempts": 5,
+    "webhook_signature_spec": "copy exact official signing algorithm, headers, canonical payload and timestamp window here"
+  },
+  "activation": {
+    "enabled": false,
+    "operator_approval_reference": "",
+    "sandbox_test_run": "",
+    "production_enabled_at": ""
+  }
+}

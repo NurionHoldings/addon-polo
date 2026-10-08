@@ -67,7 +67,7 @@ def create_user(username,password,role='admin',tenant_id=None):
 def esc(v): return html.escape(str(v if v is not None else ''),quote=True)
 def won(v): return f'{int(v or 0):,}원'
 def page(title, body, user=None, active='dashboard', csrf=''):
-    nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in [('dashboard','대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('tenants','입점업체'),('channels','판매 채널')])
+    nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in [('dashboard','대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널')])
     who=f'{esc(user["username"])} · {esc(user["role"])}' if user else '로그인 필요'
     logout=f'<form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(csrf)}"><button class="link">로그아웃</button></form>' if user else ''
     return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} | 온빌딩</title><style>
@@ -114,7 +114,7 @@ class App:
             if path.endswith('.csv'):
                 return self.get_csv(path,user,start_response)
             if path=='/':path='/dashboard'
-            routes={'/dashboard':self.dashboard,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
+            routes={'/dashboard':self.dashboard,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
             if path not in routes:return self.error(start_response,'404 Not Found','요청한 화면을 찾지 못했습니다.',user,csrf)
             if path=='/settlements':
                 selected=parse_qs(environ.get('QUERY_STRING','')).get('period',[''])[0]
@@ -229,6 +229,58 @@ class App:
         rowshtml=''.join(f'<tr><td>{esc(r["period"])}</td><td>{esc(r["tenant"])}</td><td>{r["fee_rate"]}%</td><td class="right">{won(r["basis_amount"])}</td><td class="right">{won(r["fee_amount"])}</td><td class="right">{won(r["vat_amount"])}</td><td class="right"><b>{won(r["total_amount"])}</b></td><td><span class="badge {"" if r["status"]=="paid" else "warn"}">{"수납완료" if r["status"]=="paid" else "발행"}</span></td><td>{esc(r["generated_at"][:10])}</td><td>{f'<form method="post" action="/settlements/paid"><input type="hidden" name="csrf" value="{esc(csrf)}"><input type="hidden" name="statement_id" value="{r["id"]}"><button class="btn">수납 처리</button></form>' if user["role"] in ("admin","finance") and r["status"]!="paid" else "—"}</td></tr>' for r in rows)
         picker=f'<form class="inline" method="get" action="/settlements"><label>조회 월 <input type="month" name="period" value="{esc(period)}" required></label><button class="btn">조회</button></form>'
         return page('수수료 정산',f'<div class="row"><div><h1>수수료 정산</h1><div class="sub">계약 수수료율과 매출 이벤트를 기준으로 잠금형 월별 명세를 생성합니다.</div></div><a class="btn" href="/statements.csv">정산 내역 CSV</a></div>{picker}{gen}<section class="panel"><h2>{period} 명세</h2><div class="tablewrap"><table><thead><tr><th>기간</th><th>업체</th><th>율</th><th>수수료 기준액</th><th>수수료</th><th>수수료 부가세</th><th>청구액</th><th>상태</th><th>생성일</th><th>처리</th></tr></thead><tbody>{rowshtml or "<tr><td colspan=10>해당 월에 생성된 정산 명세가 없습니다.</td></tr>"}</tbody></table></div></section><div class="note">공급가액 기준 수수료에 부가세 10% 별도 부과. 과세 거래의 상품 부가세는 거래 입력 시 함께 기록해야 합니다. 면세 입점업체는 업체 설정의 면세 구분을 따릅니다.</div>',user,'settlements',csrf)
+    def connectors_page(self,user,csrf):
+        self.require(user,'admin','finance')
+        path=os.path.join(ROOT,'connectors','catalog.json')
+        try:
+            with open(path,encoding='utf-8') as f:catalog=json.load(f)
+        except (OSError,json.JSONDecodeError):
+            raise ValueError('연동 카탈로그를 읽을 수 없습니다. 배포 파일에 connectors/catalog.json이 포함되었는지 확인하세요.')
+        cards=[]
+        for item in catalog.get('connectors',[]):
+            needs=''.join(f'<li>{esc(x)}</li>' for x in item.get('partner_inputs',[]))
+            cards.append(f'<section class="panel"><div class="row"><h2>{esc(item.get("name"))}</h2><span class="badge warn">{esc(item.get("readiness"))}</span></div><p>{esc(item.get("purpose"))}</p><p class="small">자료가 연결될 위치: <code>{esc(item.get("target"))}</code> · 현재 방식: {esc(item.get("current_mode"))}</p><details><summary>업체와 확인할 내용</summary><ul>{needs}</ul></details></section>')
+        body='<div class="row"><div><h1>아르카온 · 연동 준비</h1><div class="sub">업체 사양을 받으면 이 표준에 맞춰 공급사별 연결기를 구현합니다.</div></div></div><div class="note">자동 API 연동은 아직 켜져 있지 않습니다. 공식 문서·판매자 동의·샌드박스 확인 전에는 CSV 방식으로 운영하세요. 비밀키는 이 앱이나 저장소에 입력하지 않습니다.</div><section class="panel"><h2>공통 처리 순서</h2><p>업체 원본 ID와 원자료를 유지 → 표준 매출/정산 형식으로 변환 → 중복 검사 → 화면에서 합계 대조 → 승인된 자료만 원장에 기록</p><p class="small">계약과 API 사양, 테스트 결과를 확인한 뒤 운영자가 업체별 연결 사용을 승인해야 합니다.</p></section>'+''.join(cards)
+        return page('연동 준비',body,user,'connectors',csrf)
+    def arkaon_analysis(self,user,csrf):
+        period=today_kst().strftime('%Y-%m')
+        first=dt.date.fromisoformat(period+'-01');next_month=(first.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+        with conn() as c:
+            clauses='WHERE e.occurred_on>=? AND e.occurred_on<?';args=[first.isoformat(),next_month.isoformat()]
+            if user['role']=='tenant':clauses+=' AND e.tenant_id=?';args.append(user['tenant_id'])
+            total=c.execute(f'SELECT COUNT(*) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM sale_events e {clauses}',args).fetchone()
+            tenant_rows=[]
+            if user['role']!='tenant':
+                tenant_rows=c.execute('SELECT t.name,t.fee_rate,t.vat_mode,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM tenants t LEFT JOIN sale_events e ON e.tenant_id=t.id AND e.occurred_on>=? AND e.occurred_on<? WHERE t.active=1 GROUP BY t.id ORDER BY gross DESC,t.name',(first.isoformat(),next_month.isoformat())).fetchall()
+            else:
+                tenant_rows=c.execute('SELECT t.name,t.fee_rate,t.vat_mode,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM tenants t LEFT JOIN sale_events e ON e.tenant_id=t.id AND e.occurred_on>=? AND e.occurred_on<? WHERE t.id=? GROUP BY t.id',(first.isoformat(),next_month.isoformat(),user['tenant_id'])).fetchall()
+            channel_sql='SELECT ch.name,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross FROM channels ch LEFT JOIN sale_events e ON e.channel_id=ch.id AND e.occurred_on>=? AND e.occurred_on<?'+(' AND e.tenant_id=?' if user['role']=='tenant' else '')+' WHERE ch.active=1 GROUP BY ch.id ORDER BY gross DESC,ch.name'
+            channel_args=(first.isoformat(),next_month.isoformat())+((user['tenant_id'],) if user['role']=='tenant' else ())
+            channel_rows=c.execute(channel_sql,channel_args).fetchall()
+            mismatch=[];bad_tax=[];unlinked=[]
+            if user['role']!='tenant':
+                mismatch=c.execute('SELECT settlement_ref,settlement_date,expected_amount,received_amount,channel_id FROM payout_records WHERE expected_amount<>received_amount ORDER BY settlement_date DESC LIMIT 20').fetchall()
+                bad_tax=c.execute('SELECT e.order_id,e.occurred_on,e.gross_amount,e.tax_amount,t.name tenant FROM sale_events e JOIN tenants t ON t.id=e.tenant_id WHERE ABS(e.tax_amount)>ABS(e.gross_amount) ORDER BY e.id DESC LIMIT 20').fetchall()
+                unlinked=c.execute("SELECT p.settlement_ref,p.settlement_date,ch.name channel FROM payout_records p JOIN channels ch ON ch.id=p.channel_id WHERE NOT EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=p.channel_id AND e.settlement_ref=p.settlement_ref) ORDER BY p.settlement_date DESC LIMIT 20").fetchall()
+                no_sales=c.execute('SELECT ch.name FROM channels ch WHERE ch.active=1 AND NOT EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=ch.id AND e.occurred_on>=? AND e.occurred_on<?)',(first.isoformat(),next_month.isoformat())).fetchall()
+                no_sales=[r['name'] for r in no_sales]
+            else:
+                mismatch=[];bad_tax=[];unlinked=[];no_sales=[]
+        gross=int(total['gross']);tax=int(total['tax'])
+        fee=sum(round((int(r['gross']) if r['vat_mode']=='exempt' else int(r['gross'])-int(r['tax']))*float(r['fee_rate'])/100) for r in tenant_rows)
+        metrics=''.join(f'<div class="card metric"><small>{esc(k)}</small><strong>{esc(v)}</strong></div>' for k,v in [('조회 기간',period),('원장 거래 건수',f'{total["n"]:,}건'),('결제·환불 순액',won(gross)),('현재 입력 기준 수수료 참고액',won(fee))])
+        table=''.join(f'<tr><td>{esc(r["name"])}</td><td>{r["n"]:,}</td><td class="right">{won(r["gross"])}</td><td class="right">{won(r["tax"])}</td></tr>' for r in tenant_rows)
+        channels=''.join(f'<tr><td>{esc(r["name"])}</td><td>{r["n"]:,}</td><td class="right">{won(r["gross"])}</td></tr>' for r in channel_rows)
+        alerts=[]
+        for r in mismatch:alerts.append(f'<li><b>입금 차이 확인:</b> {esc(r["settlement_ref"])} · 예정 {won(r["expected_amount"])} / 실제 {won(r["received_amount"])} · {esc(r["settlement_date"])}</li>')
+        for r in unlinked:alerts.append(f'<li><b>참조번호 확인:</b> 정산 {esc(r["settlement_ref"])}가 매출 원장 거래에 연결되지 않습니다. 매출 자료에 참조번호를 넣지 않는 업체라면 참고만 하세요.</li>')
+        for r in bad_tax:alerts.append(f'<li><b>세액 확인:</b> {esc(r["tenant"])} 주문 {esc(r["order_id"])}의 상품 세액이 결제액보다 큽니다.</li>')
+        for name in no_sales:alerts.append(f'<li><b>자료 수집 확인:</b> {esc(name)} 채널에 이번 달 원장 자료가 없습니다. 판매가 없었던 것인지 업로드가 빠졌는지 확인하세요.</li>')
+        if any((int(r['gross']) if r['vat_mode']=='exempt' else int(r['gross'])-int(r['tax']))<0 for r in tenant_rows):alerts.append('<li><b>환불 이월 검토:</b> 조회 기간의 환불·취소가 매출보다 커 수수료 기준액이 음수입니다. 정산 담당자가 계약상 이월 처리 방법을 확인해야 합니다.</li>')
+        alert_body=''.join(alerts) or '<li>현재 규칙으로 확인할 항목이 없습니다. 원본 POS·판매·은행 자료와 등록 합계를 계속 대조하세요.</li>'
+        review=f'<section class="panel"><h2>입점업체별 합계</h2><div class="tablewrap"><table><thead><tr><th>업체</th><th>원장 건수</th><th>결제·환불 순액</th><th>상품 세액</th></tr></thead><tbody>{table}</tbody></table></div></section>' if user['role']!='tenant' else ''
+        body=f'<div class="row"><div><h1>아르카온 관리·분석</h1><div class="sub">원장에 등록된 숫자를 읽어 운영자가 확인할 항목을 정리합니다. 자동 추정이 아니라 근거가 보이는 규칙 분석입니다.</div></div><a class="btn" href="/sales.csv">내 매출 자료</a></div><div class="cards">{metrics}</div><section class="panel"><h2>확인할 항목</h2><ul>{alert_body}</ul></section>{review}<section class="panel"><h2>채널별 자료 현황</h2><div class="tablewrap"><table><thead><tr><th>채널</th><th>원장 건수</th><th>결제·환불 순액</th></tr></thead><tbody>{channels}</tbody></table></div></section><div class="note">분석은 현재 DB에 들어온 자료만 사용합니다. 채널에 매출이 없다고 해서 누락을 확정하지 않으며, 계약별 수수료 기준과 세무 판단을 대신하지 않습니다. ‘현재 입력 기준 수수료 참고액’은 월 명세서와 구분해 확인하세요.</div>'
+        return page('아르카온 분석',body,user,'arkaon',csrf)
     def tenants(self,user,csrf):
         self.require(user,'admin','finance')
         with conn() as c:rows=c.execute('SELECT * FROM tenants ORDER BY id DESC').fetchall()

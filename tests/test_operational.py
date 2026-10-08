@@ -108,6 +108,28 @@ class OperationalFlowTest(unittest.TestCase):
         self.assertIn('POS-TEST-1', vendor_sales['body'])
         self.assertTrue(self.request('/tenants', cookie=vendor_cookie)['status'].startswith('403'))
         self.assertTrue(self.request('/reconcile', cookie=vendor_cookie)['status'].startswith('403'))
+        self.assertTrue(self.request('/connectors', cookie=vendor_cookie)['status'].startswith('403'))
+
+    def test_arkaon_analysis_hides_other_tenants_amounts(self):
+        with app.conn() as c:
+            other_id=c.execute(
+                "INSERT INTO tenants(name,fee_rate,vat_mode,created_at) VALUES(?,?,?,?)",
+                ('다른 업체 분석격리', '15.00', 'taxable', app.now_iso()),
+            ).lastrowid
+            other=c.execute('SELECT * FROM tenants WHERE id=?',(other_id,)).fetchone()
+            channel=c.execute('SELECT * FROM channels WHERE id=?',(self.channel_id,)).fetchone()
+            today=app.today_kst().isoformat()
+            app.App.insert_event(c,other,channel,'FOREIGN-ANALYTICS','FOREIGN-ORDER','sale',today,'',987654,0,0,'card','',None,1)
+        vendor_cookie=self.login('vendor','LongSecurePass456!')
+        response=self.request('/arkaon',cookie=vendor_cookie)
+        self.assertNotIn('987,654원',response['body'])
+
+    def test_connector_readiness_page_loads_catalog_for_staff(self):
+        admin_cookie=self.login('owner','LongSecurePass123!')
+        response=self.request('/connectors',cookie=admin_cookie)
+        self.assertTrue(response['status'].startswith('200'))
+        self.assertIn('공용 POS / VAN',response['body'])
+        self.assertIn('공식 문서',response['body'])
 
     def test_financial_mutations_require_csrf(self):
         cookie = self.login('owner', 'LongSecurePass123!')
