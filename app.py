@@ -5,7 +5,7 @@ import argparse, csv, datetime as dt, hashlib, hmac, html, io, json, os, secrets
 from email.parser import BytesParser
 from email.policy import default
 from http import cookies
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from wsgiref.simple_server import make_server
 
 ROOT=os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL 
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id), csrf TEXT NOT NULL, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS login_failures(username_key TEXT NOT NULL, attempted_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, filename TEXT NOT NULL, file_hash TEXT NOT NULL, imported_by INTEGER REFERENCES users(id), row_count INTEGER NOT NULL, duplicate_count INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind,file_hash));
-CREATE TABLE IF NOT EXISTS sale_events(id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL REFERENCES tenants(id), channel_id INTEGER NOT NULL REFERENCES channels(id), event_key TEXT NOT NULL, order_id TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('sale','refund','cancel')), occurred_on TEXT NOT NULL, product TEXT NOT NULL DEFAULT '', gross_amount INTEGER NOT NULL, discount_amount INTEGER NOT NULL DEFAULT 0, tax_amount INTEGER NOT NULL DEFAULT 0, payment_method TEXT NOT NULL DEFAULT '', settlement_ref TEXT NOT NULL DEFAULT '', import_batch_id INTEGER REFERENCES import_batches(id), created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(channel_id,event_key));
+CREATE TABLE IF NOT EXISTS sale_events(id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL REFERENCES tenants(id), channel_id INTEGER NOT NULL REFERENCES channels(id), event_key TEXT NOT NULL, order_id TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('sale','refund','cancel')), occurred_on TEXT NOT NULL, product TEXT NOT NULL DEFAULT '', quantity INTEGER NOT NULL DEFAULT 1, gross_amount INTEGER NOT NULL, discount_amount INTEGER NOT NULL DEFAULT 0, tax_amount INTEGER NOT NULL DEFAULT 0, payment_method TEXT NOT NULL DEFAULT '', settlement_ref TEXT NOT NULL DEFAULT '', import_batch_id INTEGER REFERENCES import_batches(id), created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(channel_id,event_key));
 CREATE INDEX IF NOT EXISTS sale_period_idx ON sale_events(tenant_id,occurred_on);
 CREATE TABLE IF NOT EXISTS payout_records(id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL REFERENCES channels(id), settlement_ref TEXT NOT NULL, settlement_date TEXT NOT NULL, expected_amount INTEGER NOT NULL DEFAULT 0, received_amount INTEGER NOT NULL DEFAULT 0, provider_fee INTEGER NOT NULL DEFAULT 0, bank_ref TEXT NOT NULL DEFAULT '', created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(channel_id,settlement_ref));
 CREATE TABLE IF NOT EXISTS statements(id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL REFERENCES tenants(id), period TEXT NOT NULL, fee_rate TEXT NOT NULL, basis_amount INTEGER NOT NULL, fee_amount INTEGER NOT NULL, vat_amount INTEGER NOT NULL, total_amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'issued' CHECK(status IN ('issued','paid')), generated_by INTEGER REFERENCES users(id), generated_at TEXT NOT NULL, paid_at TEXT, UNIQUE(tenant_id,period));
@@ -43,7 +43,13 @@ def conn():
     return c
 
 def init_db():
-    with conn() as c: c.executescript(SCHEMA)
+    with conn() as c:
+        c.executescript(SCHEMA)
+        columns={r['name'] for r in c.execute('PRAGMA table_info(sale_events)')}
+        if 'quantity' not in columns:
+            c.execute('ALTER TABLE sale_events ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1')
+            # Legacy rows did not store signed quantities. Reversals must be negative.
+            c.execute("UPDATE sale_events SET quantity=-1 WHERE event_type IN ('refund','cancel')")
 def audit(c, actor, action, kind, oid, details=None):
     c.execute('INSERT INTO audit_log(actor_id,action,object_type,object_id,detail_json,created_at) VALUES(?,?,?,?,?,?)',(actor,action,kind,str(oid),json.dumps(details or {},ensure_ascii=False,sort_keys=True),now_iso()))
 def password_hash(password, salt=None):
@@ -68,9 +74,9 @@ def esc(v): return html.escape(str(v if v is not None else ''),quote=True)
 def won(v): return f'{int(v or 0):,}원'
 def page(title, body, user=None, active='dashboard', csrf=''):
     menus={
-        'admin':[('admin','관리자 홈'),('dashboard','운영 대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널'),('audit','감사 이력')],
-        'finance':[('dashboard','대시보드'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비')],
-        'tenant':[('dashboard','내 현황'),('sales','내 매출'),('settlements','수수료 명세'),('arkaon','아르카온 분석')],
+        'admin':[('admin','관리자 홈'),('dashboard','운영 대시보드'),('reports','매출 보고서'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널'),('audit','감사 이력')],
+        'finance':[('dashboard','대시보드'),('reports','매출 보고서'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비')],
+        'tenant':[('dashboard','내 현황'),('reports','내 매출 보고서'),('sales','내 매출'),('settlements','수수료 명세'),('arkaon','아르카온 분석')],
     }
     links=menus.get(user['role'],[]) if user else []
     nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in links)
@@ -101,6 +107,8 @@ body{{font-family:Pretendard,"Noto Sans KR",system-ui,-apple-system,sans-serif;l
 .btn,.small,.sub,.note,.error,.success,.user,nav a,th,td,label,.badge{{font-size:12px}}
 main{{margin-top:30px}}.card,.panel{{padding:20px}}
 th{{padding:13px 12px}}td{{padding:14px 12px}}
+.report-stats{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}}.report-stats .card{{padding:15px}}.report-stats small{{display:block;color:var(--muted)}}.report-stats strong{{display:block;font-size:20px;margin-top:6px}}.report-section{{margin-top:16px}}.report-section h2{{margin:0}}.report-actions{{display:flex;gap:8px;flex-wrap:wrap}}.report-filters{{display:flex;gap:10px;align-items:end;flex-wrap:wrap}}.report-filters label{{margin:0}}.report-table{{min-width:760px}}.report-table .right{{font-variant-numeric:tabular-nums}}.print-only{{display:none}}.report-note{{font-size:12px;color:#4f5c69;background:#f2f1eb;border-left:3px solid #8e9caf;padding:12px 14px;border-radius:6px;margin-top:14px}}
+@media print{{@page{{size:landscape;margin:12mm}}body{{background:#fff!important;color:#111;font-size:10pt}}header,nav,.report-controls,.motion-toggle,.report-actions{{display:none!important}}main{{max-width:none;margin:0;padding:0}}.report-section{{break-inside:avoid;margin-top:10mm}}.panel,.card{{box-shadow:none!important;border:1px solid #aaa!important;background:#fff!important}}.report-stats{{grid-template-columns:repeat(5,1fr)}}.report-stats .card{{padding:8px}}.report-table{{min-width:0;white-space:normal}}.report-table th,.report-table td{{font-size:8pt;padding:5px}}.report-table tr{{break-inside:avoid}}.print-only{{display:block}}a{{color:#111;text-decoration:none}}}}
 </style></head><body><header><a class="brand" href="/" aria-label="아세아홀딩스 누리온 세일즈허브 홈"><span class="brand-mark"><img src="/nurion-logo.svg" alt=""><i class="brand-orbit"></i></span><span class="brand-copy"><small>아세아홀딩스</small><strong>누리온 세일즈허브</strong></span></a><div class="user"><button class="motion-toggle" type="button" data-motion-toggle aria-label="로고 애니메이션 끄기">로고 움직임 끄기</button>{who}{logout}</div></header>{f'<nav>{nav}</nav>' if nav else ''}<main>{body}</main>{motion_script}</body></html>'''
 
 def public_home_page():
@@ -157,10 +165,12 @@ class App:
                 return self.post(path,data,user,start_response,csrf)
             if method!='GET': return self.error(start_response,'405 Method Not Allowed','지원하지 않는 요청입니다.',user,csrf)
             if path.endswith('.csv'):
-                return self.get_csv(path,user,start_response)
-            routes={'/admin':self.admin_console,'/dashboard':self.dashboard,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
+                return self.get_csv(path,user,start_response,environ.get('QUERY_STRING',''))
+            routes={'/admin':self.admin_console,'/dashboard':self.dashboard,'/reports':self.reports,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
             if path not in routes:return self.error(start_response,'404 Not Found','요청한 화면을 찾지 못했습니다.',user,csrf)
-            if path=='/settlements':
+            if path=='/reports':
+                body=routes[path](user,csrf,environ.get('QUERY_STRING',''))
+            elif path=='/settlements':
                 selected=parse_qs(environ.get('QUERY_STRING','')).get('period',[''])[0]
                 if selected:
                     try:dt.date.fromisoformat(selected+'-01')
@@ -227,7 +237,7 @@ class App:
             fee=float(c.execute('SELECT fee_rate FROM tenants WHERE id=?',(user['tenant_id'],)).fetchone()['fee_rate']) if user['role']=='tenant' else 10
             exp=c.execute('SELECT COUNT(*) n FROM payout_records WHERE expected_amount<>received_amount').fetchone()['n'] if user['role']!='tenant' else unpaid['n']
         base=int(s['gross']-s['tax']);feeamt=round(base*fee/100);blocks=''.join(f'<div class="card metric"><small>{label}</small><strong>{value}</strong></div>' for label,value in [('오늘 매출(결제·환불 순액)',won(s['gross'])),('오늘 수수료 예상',won(feeamt)),('입금 차액 대기',won(unpaid['amt'])),('확인할 대사 건',f'{exp}건')])
-        rows=''.join(self.sale_row(x) for x in recent) or '<tr><td colspan="8">거래 기록이 없습니다. 매출을 등록하거나 CSV를 가져오세요.</td></tr>'
+        rows=''.join(self.sale_row(x) for x in recent) or '<tr><td colspan="10">거래 기록이 없습니다. 매출을 등록하거나 CSV를 가져오세요.</td></tr>'
         body=f'<div class="row"><div><h1>통합 매출 대시보드</h1><div class="sub">주문 원장, 수수료와 입금 대사 현황</div></div><a class="btn primary" href="/sales">매출 원장 열기</a></div><div class="cards">{blocks}</div><div class="grid"><section class="panel"><h2>미대사 정산</h2>{self.recon_preview(user)}</section><section class="panel"><h2>정산 운영 상태</h2><p class="small">수수료율은 업체 계약 설정을 따릅니다. 월 마감 시점에 해당 월 정산 스냅샷을 생성하세요.</p><a class="btn" href="/settlements">정산 생성·조회</a><div class="note">원본 거래는 수정·삭제하지 않습니다. 환불은 별도 음수 거래로 등록되어 기존 매출과 이력이 보존됩니다.</div></section></div><section class="panel"><h2>최근 거래</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows}</tbody></table></div></section>'
         return page('대시보드',body,user,'dashboard',csrf)
     def admin_console(self,user,csrf):
@@ -255,8 +265,8 @@ class App:
         <div class="grid admin-grid"><section class="panel"><h2>관리자 점검 순서</h2><ol class="checklist"><li><span>01</span><div><b>입점 계약 등록</b><small>수수료율·과세 구분을 계약서와 맞춰 입력합니다.</small></div></li><li><span>02</span><div><b>판매 채널 준비</b><small>POS와 온라인·라이브 채널별 담당자와 자료 수집 방법을 확인합니다.</small></div></li><li><span>03</span><div><b>자료 대사 후 월 마감</b><small>누락·중복과 입금 차이를 확인한 뒤 수수료 명세를 생성합니다.</small></div></li></ol></section><section class="panel"><h2>최근 관리자 변경</h2><div class="tablewrap"><table><thead><tr><th>일시</th><th>사용자</th><th>작업</th><th>대상</th></tr></thead><tbody>{recent_html}</tbody></table></div><p class="small">관리자 변경은 감사 이력에 남습니다.</p></section></div>
         <div class="note">이 페이지는 관리자 계정만 볼 수 있습니다. 정산 차이와 발행액은 현재 원장에 등록된 자료 기준이며, 자동 송금이나 자료의 자동 수정은 수행하지 않습니다.</div>'''
         return page('관리자 전용',body,user,'admin',csrf)
-    def sale_head(self):return '<thead><tr><th>발생일</th><th>주문번호</th><th>업체</th><th>채널</th><th>유형</th><th>결제액</th><th>세액</th><th>결제수단</th></tr></thead>'
-    def sale_row(self,r):return f'<tr><td>{esc(r["occurred_on"])}</td><td>{esc(r["order_id"])}</td><td>{esc(r["tenant"])}</td><td>{esc(r["channel"])}</td><td>{esc(r["event_type"])}</td><td class="right">{won(r["gross_amount"])}</td><td class="right">{won(r["tax_amount"])}</td><td>{esc(r["payment_method"])}</td></tr>'
+    def sale_head(self):return '<thead><tr><th>발생일</th><th>주문번호</th><th>업체</th><th>채널</th><th>유형</th><th>상품</th><th>수량</th><th>결제액</th><th>세액</th><th>결제수단</th></tr></thead>'
+    def sale_row(self,r):return f'<tr><td>{esc(r["occurred_on"])}</td><td>{esc(r["order_id"])}</td><td>{esc(r["tenant"])}</td><td>{esc(r["channel"])}</td><td>{esc(r["event_type"])}</td><td>{esc(r["product"] or "미지정 품목")}</td><td class="right">{r["quantity"]:,}</td><td class="right">{won(r["gross_amount"])}</td><td class="right">{won(r["tax_amount"])}</td><td>{esc(r["payment_method"])}</td></tr>'
     def recon_preview(self,user):
         if user['role']=='tenant': return '<p class="small">업체별 정산 입금 자료는 운영자 정산 화면에서 관리합니다.</p>'
         with conn() as c:
@@ -265,6 +275,83 @@ class App:
             if user['role']=='tenant':q+=' AND p.channel_id IN (SELECT channel_id FROM sale_events WHERE tenant_id=?)';a=(user['tenant_id'],)
             rows=c.execute(q+' ORDER BY p.settlement_date DESC LIMIT 5',a).fetchall()
         return '<div class="tablewrap"><table><tr><th>정산참조</th><th>채널</th><th>예정</th><th>입금</th></tr>'+''.join(f'<tr><td>{esc(r["settlement_ref"])}</td><td>{esc(r["channel"])}</td><td>{won(r["expected_amount"])}</td><td>{won(r["received_amount"])}</td></tr>' for r in rows)+'</table></div>' if rows else '<p class="small">미대사 자료가 없습니다.</p>'
+    def report_filters(self,user,query_string):
+        params=parse_qs(query_string,keep_blank_values=True)
+        today=today_kst();month_start=today.replace(day=1)
+        start=params.get('start',[''])[0] or month_start.isoformat()
+        end=params.get('end',[''])[0] or today.isoformat()
+        try:
+            start_date=dt.date.fromisoformat(start);end_date=dt.date.fromisoformat(end)
+        except ValueError:raise ValueError('조회일은 YYYY-MM-DD 형식으로 입력해 주세요.')
+        if start_date.isoformat()!=start or end_date.isoformat()!=end:raise ValueError('조회일은 YYYY-MM-DD 형식으로 입력해 주세요.')
+        if start_date>end_date:raise ValueError('시작일은 종료일보다 늦을 수 없습니다.')
+        tenant_id=user['tenant_id'] if user['role']=='tenant' else None
+        selected_tenant=params.get('tenant_id',[''])[0]
+        with conn() as c:
+            if user['role']!='tenant' and selected_tenant:
+                try:tenant_id=int(selected_tenant)
+                except ValueError:raise ValueError('업체 선택을 확인해 주세요.')
+                if not c.execute('SELECT 1 FROM tenants WHERE id=?',(tenant_id,)).fetchone():raise ValueError('등록된 업체를 찾지 못했습니다.')
+            channel_id=None
+            raw_channel=params.get('channel_id',[''])[0]
+            if raw_channel:
+                try:channel_id=int(raw_channel)
+                except ValueError:raise ValueError('채널 선택을 확인해 주세요.')
+                if not c.execute('SELECT 1 FROM channels WHERE id=?',(channel_id,)).fetchone():raise ValueError('등록된 채널을 찾지 못했습니다.')
+            tenants=c.execute('SELECT id,name FROM tenants WHERE id=? ORDER BY name',(user['tenant_id'],)).fetchall() if user['role']=='tenant' else c.execute('SELECT id,name FROM tenants WHERE active=1 ORDER BY name').fetchall()
+            channels=c.execute('SELECT id,name FROM channels WHERE active=1'+(' AND id IN (SELECT channel_id FROM sale_events WHERE tenant_id=?)' if user['role']=='tenant' else '')+' ORDER BY name',((user['tenant_id'],) if user['role']=='tenant' else ())).fetchall()
+        return {'start':start,'end':end,'tenant_id':tenant_id,'channel_id':channel_id,'tenants':tenants,'channels':channels}
+    def report_data(self,filters):
+        where=['e.occurred_on>=?','e.occurred_on<=?'];args=[filters['start'],filters['end']]
+        if filters['tenant_id'] is not None:where.append('e.tenant_id=?');args.append(filters['tenant_id'])
+        if filters['channel_id'] is not None:where.append('e.channel_id=?');args.append(filters['channel_id'])
+        source='FROM sale_events e JOIN tenants t ON t.id=e.tenant_id JOIN channels ch ON ch.id=e.channel_id WHERE '+' AND '.join(where)
+        sums='''COUNT(CASE WHEN e.event_type='sale' THEN 1 END) sales_count,
+        COUNT(CASE WHEN e.event_type IN ('refund','cancel') THEN 1 END) reversals_count,
+        SUM(CASE WHEN e.event_type='sale' THEN e.quantity ELSE 0 END) sold_quantity,
+        SUM(CASE WHEN e.event_type IN ('refund','cancel') THEN -e.quantity ELSE 0 END) returned_quantity,
+        SUM(e.quantity) net_quantity,
+        SUM(CASE WHEN e.event_type='sale' THEN e.gross_amount ELSE 0 END) sales_amount,
+        SUM(CASE WHEN e.event_type='refund' THEN -e.gross_amount ELSE 0 END) refund_amount,
+        SUM(CASE WHEN e.event_type='cancel' THEN -e.gross_amount ELSE 0 END) cancel_amount,
+        SUM(e.gross_amount) net_amount,
+        SUM(CASE WHEN t.vat_mode='exempt' THEN e.gross_amount ELSE e.gross_amount-e.tax_amount END) supply_amount,
+        SUM(e.tax_amount) tax_amount,
+        SUM(CASE WHEN e.event_type='sale' THEN e.discount_amount ELSE 0 END) discount_amount'''
+        with conn() as c:
+            totals=c.execute('SELECT '+sums+' '+source,args).fetchone()
+            items=c.execute('SELECT t.name tenant,ch.name channel,COALESCE(NULLIF(TRIM(e.product),\'\'),\'미지정 품목\') product,'+sums+' '+source+' GROUP BY t.id,ch.id,COALESCE(NULLIF(TRIM(e.product),\'\'),\'미지정 품목\') ORDER BY net_amount DESC,product,t.name,ch.name',args).fetchall()
+            daily=c.execute('SELECT e.occurred_on period,'+sums+' '+source+' GROUP BY e.occurred_on ORDER BY e.occurred_on',args).fetchall()
+            monthly=c.execute("SELECT substr(e.occurred_on,1,7) period,"+sums+' '+source+" GROUP BY substr(e.occurred_on,1,7) ORDER BY period",args).fetchall()
+        return totals,items,daily,monthly
+    def reports(self,user,csrf,query_string=''):
+        filters=self.report_filters(user,query_string)
+        totals,items,daily,monthly=self.report_data(filters)
+        tenant_names={r['id']:r['name'] for r in filters['tenants']}
+        tenant_label=tenant_names.get(filters['tenant_id'],'전체 업체') if filters['tenant_id'] is not None else '전체 업체'
+        channel_names={r['id']:r['name'] for r in filters['channels']}
+        channel_label=channel_names.get(filters['channel_id'],'전체 채널') if filters['channel_id'] is not None else '전체 채널'
+        query=urlencode({k:v for k,v in [('start',filters['start']),('end',filters['end']),('tenant_id',filters['tenant_id'] or ''),('channel_id',filters['channel_id'] or '')] if v})
+        tenant_opts=''.join(f'<option value="{r["id"]}"{" selected" if r["id"]==filters["tenant_id"] else ""}>{esc(r["name"])}</option>' for r in filters['tenants'])
+        channel_opts=''.join(f'<option value="{r["id"]}"{" selected" if r["id"]==filters["channel_id"] else ""}>{esc(r["name"])}</option>' for r in filters['channels'])
+        tenant_filter='' if user['role']=='tenant' else f'<label>업체<select name="tenant_id"><option value="">전체 업체</option>{tenant_opts}</select></label>'
+        stats=''.join(f'<article class="card"><small>{label}</small><strong>{value}</strong></article>' for label,value in [('판매 결제액',won(totals['sales_amount'] or 0)),('환불액',won(totals['refund_amount'] or 0)),('취소액',won(totals['cancel_amount'] or 0)),('순매출 · 결제 기준',won(totals['net_amount'] or 0)),('순판매 수량',f'{totals["net_quantity"] or 0:,}개')])
+        include_tenant=user['role']!='tenant'
+        item_rows_list=[]
+        for r in items:
+            cols=[f'<td>{esc(r["tenant"])}</td>'] if include_tenant else []
+            cols.extend([f'<td>{esc(r["channel"])}</td>',f'<td>{esc(r["product"])}</td>',f'<td class="right">{r["sales_count"]:,}</td>',f'<td class="right">{r["sold_quantity"]:,}</td>',f'<td class="right">{r["returned_quantity"]:,}</td>',f'<td class="right">{r["net_quantity"]:,}</td>',f'<td class="right">{won(r["sales_amount"])}</td>',f'<td class="right">{won(r["refund_amount"])}</td>',f'<td class="right">{won(r["cancel_amount"])}</td>',f'<td class="right"><b>{won(r["net_amount"])}</b></td>',f'<td class="right">{won(r["supply_amount"])}</td>'])
+            item_rows_list.append('<tr>'+''.join(cols)+'</tr>')
+        item_rows=''.join(item_rows_list)
+        if not item_rows:item_rows=f'<tr><td colspan="{12 if include_tenant else 11}">선택한 기간에 매출 자료가 없습니다.</td></tr>'
+        def period_rows(rows):
+            return ''.join(f'<tr><td>{esc(r["period"])}</td><td class="right">{r["sales_count"]:,}</td><td class="right">{r["reversals_count"]:,}</td><td class="right">{r["sold_quantity"]:,}</td><td class="right">{r["returned_quantity"]:,}</td><td class="right">{r["net_quantity"]:,}</td><td class="right">{won(r["sales_amount"])}</td><td class="right">{won(r["refund_amount"])}</td><td class="right">{won(r["cancel_amount"])}</td><td class="right"><b>{won(r["net_amount"])}</b></td><td class="right">{won(r["supply_amount"])}</td></tr>' for r in rows) or '<tr><td colspan="11">선택한 기간에 매출 자료가 없습니다.</td></tr>'
+        title_columns='<th>업체</th>' if include_tenant else ''
+        item_table=f'<section class="panel report-section"><h2>품목별 판매현황</h2><div class="tablewrap"><table class="report-table"><thead><tr>{title_columns}<th>채널</th><th>품목</th><th>매출 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{item_rows}</tbody></table></div></section>'
+        daily_table=f'<section class="panel report-section"><h2>일자별 매출총계</h2><div class="tablewrap"><table class="report-table"><thead><tr><th>일자</th><th>매출 건</th><th>환불·취소 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{period_rows(daily)}</tbody></table></div></section>'
+        monthly_table=f'<section class="panel report-section"><h2>월간 매출합계</h2><div class="tablewrap"><table class="report-table"><thead><tr><th>월</th><th>매출 건</th><th>환불·취소 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{period_rows(monthly)}</tbody></table></div></section>'
+        body=f'''<div class="report-page"><div class="row report-controls"><div><h1>매출 보고서</h1><div class="sub">품목·일자·월별 집계를 같은 조회 조건으로 확인합니다.</div></div><div class="report-actions"><button class="btn" type="button" onclick="window.print()">인쇄 · PDF 저장</button><a class="btn" href="/reports/items.csv?{query}">품목별 CSV</a><a class="btn" href="/reports/daily.csv?{query}">일자별 CSV</a><a class="btn" href="/reports/monthly.csv?{query}">월간 CSV</a></div></div><section class="panel report-controls"><form class="report-filters" method="get" action="/reports"><label>시작일<input type="date" name="start" value="{filters['start']}" required></label><label>종료일<input type="date" name="end" value="{filters['end']}" required></label>{tenant_filter}<label>채널<select name="channel_id"><option value="">전체 채널</option>{channel_opts}</select></label><button class="btn primary">조회</button><span class="small">{esc(tenant_label)} · {esc(channel_label)}</span></form></section><div class="report-stats">{stats}</div><p class="print-only">조회 기간: {filters['start']} ~ {filters['end']} · 업체: {esc(tenant_label)} · 채널: {esc(channel_label)} · 출력 기준일: {today_kst().isoformat()}</p>{item_table}{daily_table}{monthly_table}<div class="report-note">집계 기준: 결제액은 매출 이벤트에 기록된 실제 결제금액(할인 반영 후)입니다. 환불·취소는 원장에 저장된 음수 금액을 합산해 별도로 표시하고 순매출에 반영합니다. 공급가액 순액은 면세업체는 결제 순액, 과세·혼합 업체는 입력된 상품 세액을 뺀 금액입니다. 품목 수량은 새로 기록한 거래에서 입력한 수량을 쓰며, 과거 수량 정보가 없던 거래는 1개로 간주됩니다.</div></div>'''
+        return page('매출 보고서',body,user,'reports',csrf)
     def sales(self,user,csrf):
         with conn() as c:
             q='SELECT s.*,t.name tenant,ch.name channel FROM sale_events s JOIN tenants t ON t.id=s.tenant_id JOIN channels ch ON ch.id=s.channel_id';a=()
@@ -274,10 +361,10 @@ class App:
             channels=c.execute('SELECT id,name FROM channels WHERE active=1').fetchall()
         tenant_opts=''.join(f'<option value="{t["id"]}">{esc(t["name"])}</option>' for t in tenants);ch_opts=''.join(f'<option value="{x["id"]}">{esc(x["name"])}</option>' for x in channels)
         can=user['role'] in ('admin','finance')
-        add=f'''<section class="panel"><h2>거래 직접 등록</h2><form method="post" action="/sales/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>입점업체</label><select name="tenant_id" required>{tenant_opts}</select></div><div><label>판매 채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>주문번호</label><input name="order_id" required maxlength="120"></div><div><label>유형</label><select name="event_type"><option value="sale">매출</option><option value="refund">환불</option><option value="cancel">취소</option></select></div><div><label>발생일</label><input type="date" name="occurred_on" value="{today_kst().isoformat()}" required></div><div><label>실결제/환불액 (원)</label><input type="number" min="0" name="gross_amount" required></div><div><label>이 거래의 상품 부가세 (원)</label><input type="number" min="0" name="tax_amount" placeholder="과세 업체는 자동 계산 · 혼합과세는 입력"></div><div><label>상품</label><input name="product"></div><div><label>결제수단</label><input name="payment_method"></div><div><label>정산 참조번호</label><input name="settlement_ref"></div></div><p class="small">환불·취소 금액은 양수로 입력합니다. 시스템이 원장에 음수로 기록합니다. 과세 거래는 상품 부가세액을 입력해야 합니다.</p><button class="btn primary">원장에 추가</button></form></section>''' if can else ''
-        import_form=f'''<section class="panel"><h2>매출 CSV 가져오기</h2><form method="post" action="/sales/import" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>CSV 파일</label><input type="file" name="file" accept=".csv,text/csv" required></div></div><p class="small">필수 열: event_id,order_id,event_type,date,tenant,amount,tax_amount. 선택 열: discount,product,payment_method,settlement_ref. UTF-8 CSV, 6MB 이하.</p><button class="btn">검증 후 가져오기</button></form></section>''' if can else ''
-        rows_html=''.join(self.sale_row(r) for r in rows) or '<tr><td colspan="8">거래 자료가 없습니다.</td></tr>'
-        return page('매출 원장',f'<div class="row"><div><h1>매출 원장</h1><div class="sub">매출·환불을 변경 불가능한 거래 이벤트로 기록합니다.</div></div><a class="btn" href="/sales.csv">CSV 내려받기</a></div>{add}{import_form}<section class="panel"><h2>최근 거래 · 최대 500건</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows_html}</tbody></table></div></section>',user,'sales',csrf)
+        add=f'''<section class="panel"><h2>거래 직접 등록</h2><form method="post" action="/sales/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>입점업체</label><select name="tenant_id" required>{tenant_opts}</select></div><div><label>판매 채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>주문번호</label><input name="order_id" required maxlength="120"></div><div><label>유형</label><select name="event_type"><option value="sale">매출</option><option value="refund">환불</option><option value="cancel">취소</option></select></div><div><label>발생일</label><input type="date" name="occurred_on" value="{today_kst().isoformat()}" required></div><div><label>실결제/환불액 (원)</label><input type="number" min="0" name="gross_amount" required></div><div><label>수량 (개)</label><input type="number" min="1" step="1" name="quantity" value="1" required></div><div><label>이 거래의 상품 부가세 (원)</label><input type="number" min="0" name="tax_amount" placeholder="과세 업체는 자동 계산 · 혼합과세는 입력"></div><div><label>상품</label><input name="product"></div><div><label>결제수단</label><input name="payment_method"></div><div><label>정산 참조번호</label><input name="settlement_ref"></div></div><p class="small">환불·취소 금액과 수량은 양수로 입력합니다. 원장에는 음수로 기록합니다.</p><button class="btn primary">원장에 추가</button></form></section>''' if can else ''
+        import_form=f'''<section class="panel"><h2>매출 CSV 가져오기</h2><form method="post" action="/sales/import" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>CSV 파일</label><input type="file" name="file" accept=".csv,text/csv" required></div></div><p class="small">필수 열: event_id,order_id,event_type,date,tenant,amount,tax_amount. 선택 열: quantity,discount,product,payment_method,settlement_ref. quantity 생략 시 1개로 기록합니다. UTF-8 CSV, 6MB 이하.</p><button class="btn">검증 후 가져오기</button></form></section>''' if can else ''
+        rows_html=''.join(self.sale_row(r) for r in rows) or '<tr><td colspan="10">거래 자료가 없습니다.</td></tr>'
+        return page('매출 원장',f'<div class="row"><div><h1>매출 원장</h1><div class="sub">매출·환불·수량을 변경 불가능한 거래 이벤트로 기록합니다.</div></div><div class="report-actions"><a class="btn" href="/reports">매출 보고서</a><a class="btn" href="/sales.csv">CSV 내려받기</a></div></div>{add}{import_form}<section class="panel"><h2>최근 거래 · 최대 500건</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows_html}</tbody></table></div></section>',user,'sales',csrf)
     def reconcile(self,user,csrf):
         self.require(user,'admin','finance')
         with conn() as c:
@@ -372,12 +459,13 @@ class App:
             with conn() as c:
                 tenant=c.execute('SELECT * FROM tenants WHERE id=? AND active=1',(int(d['tenant_id']),)).fetchone();channel=c.execute('SELECT * FROM channels WHERE id=? AND active=1',(int(d['channel_id']),)).fetchone()
                 if not tenant or not channel:raise ValueError('업체 또는 판매 채널을 확인해 주세요.')
-                event_type=d.get('event_type','sale');gross=self.integer(d,'gross_amount');discount=self.integer(d,'discount_amount',0)
+                event_type=d.get('event_type','sale');gross=self.integer(d,'gross_amount');discount=self.integer(d,'discount_amount',0);quantity=self.integer(d,'quantity',1)
+                if quantity<1:raise ValueError('판매 수량은 1개 이상 입력해 주세요.')
                 tax_value=d.get('tax_amount','').strip()
                 tax=self.integer(d,'tax_amount') if tax_value else (round(gross/11) if tenant['vat_mode']=='taxable' else 0)
                 if tenant['vat_mode']=='mixed' and not tax_value:raise ValueError('혼합 과세 업체는 거래별 상품 부가세를 입력해야 합니다.')
-                if event_type in ('refund','cancel'):gross=-gross;tax=-tax;discount=-discount
-                key=str(uuid.uuid4());self.insert_event(c,tenant,channel,key,d['order_id'],event_type,d['occurred_on'],d.get('product',''),gross,discount,tax,d.get('payment_method',''),d.get('settlement_ref',''),None,user['id']);audit(c,user['id'],'sale_event.append',event_type,key,{'order_id':d['order_id'],'amount':gross})
+                if event_type in ('refund','cancel'):gross=-gross;tax=-tax;discount=-discount;quantity=-quantity
+                key=str(uuid.uuid4());self.insert_event(c,tenant,channel,key,d['order_id'],event_type,d['occurred_on'],d.get('product',''),gross,discount,tax,d.get('payment_method',''),d.get('settlement_ref',''),None,user['id'],quantity);audit(c,user['id'],'sale_event.append',event_type,key,{'order_id':d['order_id'],'amount':gross,'quantity':quantity})
             return self.redirect(start,'/sales')
         if path=='/sales/import':return self.import_sales(d,user,start)
         if path=='/reconcile/add':
@@ -441,13 +529,16 @@ class App:
         if n<0:raise ValueError(f'{key} 금액은 음수일 수 없습니다.')
         return n
     @staticmethod
-    def insert_event(c,tenant,channel,event_key,order_id,event_type,on,product,gross,discount,tax,payment,settlement,batch,user):
+    def insert_event(c,tenant,channel,event_key,order_id,event_type,on,product,gross,discount,tax,payment,settlement,batch,user,quantity=1):
         if event_type not in ('sale','refund','cancel'):raise ValueError('event_type은 sale/refund/cancel 중 하나여야 합니다.')
         try:dt.date.fromisoformat(on)
         except ValueError:raise ValueError('발생일은 YYYY-MM-DD 형식이어야 합니다.')
         if event_type=='sale' and (gross<0 or tax<0):raise ValueError('매출 이벤트 금액은 0 이상이어야 합니다.')
         if event_type in ('refund','cancel') and (gross>0 or tax>0):raise ValueError('환불·취소 이벤트는 원장에 음수로 기록해야 합니다.')
-        c.execute('INSERT INTO sale_events(tenant_id,channel_id,event_key,order_id,event_type,occurred_on,product,gross_amount,discount_amount,tax_amount,payment_method,settlement_ref,import_batch_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(tenant['id'],channel['id'],event_key,order_id,event_type,on,product,gross,discount,tax,payment,settlement,batch,user,now_iso()))
+        if not isinstance(quantity,int) or quantity==0:raise ValueError('판매 수량은 0이 아닌 정수여야 합니다.')
+        if event_type=='sale' and quantity<0:raise ValueError('매출 수량은 양수여야 합니다.')
+        if event_type in ('refund','cancel') and quantity>0:raise ValueError('환불·취소 수량은 원장에 음수로 기록해야 합니다.')
+        c.execute('INSERT INTO sale_events(tenant_id,channel_id,event_key,order_id,event_type,occurred_on,product,quantity,gross_amount,discount_amount,tax_amount,payment_method,settlement_ref,import_batch_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(tenant['id'],channel['id'],event_key,order_id,event_type,on,product,quantity,gross,discount,tax,payment,settlement,batch,user,now_iso()))
     def import_sales(self,d,user,start):
         self.require(user,'admin','finance');raw=d.get('file','');filename=d.get('file_filename','upload.csv')
         if not raw:raise ValueError('CSV 파일을 선택해 주세요.')
@@ -465,20 +556,20 @@ class App:
                     if not tenant:raise ValueError('입점업체 이름이 등록되지 않았습니다.')
                     typ=row['event_type'].strip().lower();typ={'sale':'sale','매출':'sale','refund':'refund','환불':'refund','cancel':'cancel','취소':'cancel'}.get(typ)
                     if not typ:raise ValueError('event_type은 sale/refund/cancel입니다.')
-                    amount=int(row['amount'].replace(',','').strip());tax_raw=(row.get('tax_amount') or '').replace(',','').strip();tax=int(tax_raw) if tax_raw else (round(amount/11) if tenant['vat_mode']=='taxable' else 0);discount=int((row.get('discount') or '0').replace(',','').strip())
+                    amount=int(row['amount'].replace(',','').strip());tax_raw=(row.get('tax_amount') or '').replace(',','').strip();tax=int(tax_raw) if tax_raw else (round(amount/11) if tenant['vat_mode']=='taxable' else 0);discount=int((row.get('discount') or '0').replace(',','').strip());quantity=int((row.get('quantity') or '1').replace(',','').strip())
                     if tenant['vat_mode']=='mixed' and not tax_raw:raise ValueError('혼합 과세 업체는 tax_amount가 필요합니다.')
-                    if amount<0 or tax<0 or discount<0:raise ValueError('CSV 금액은 양수로 입력해야 합니다.')
-                    if typ in ('refund','cancel'):amount=-amount;tax=-tax;discount=-discount
+                    if amount<0 or tax<0 or discount<0 or quantity<1:raise ValueError('CSV 금액은 양수, 수량은 1 이상이어야 합니다.')
+                    if typ in ('refund','cancel'):amount=-amount;tax=-tax;discount=-discount;quantity=-quantity
                     on=row['date'].strip();dt.date.fromisoformat(on)
-                    parsed.append((tenant,channel,row['event_id'].strip(),row['order_id'].strip(),typ,on,row.get('product',''),amount,discount,tax,row.get('payment_method',''),row.get('settlement_ref','')))
+                    parsed.append((tenant,channel,row['event_id'].strip(),row['order_id'].strip(),typ,on,row.get('product',''),quantity,amount,discount,tax,row.get('payment_method',''),row.get('settlement_ref','')))
                 except Exception as e:errs.append(f'{i}행: {e}')
             if errs:raise ValueError('CSV 검증 실패 — 아무 행도 저장하지 않았습니다. '+' / '.join(errs[:8]))
             if c.execute('SELECT 1 FROM import_batches WHERE kind="sales" AND file_hash=?',(fhash,)).fetchone():raise ValueError('같은 파일을 이미 가져왔습니다.')
             c.execute('BEGIN IMMEDIATE');cur=c.execute('INSERT INTO import_batches(kind,filename,file_hash,imported_by,row_count,duplicate_count,created_at) VALUES("sales",?,?,?,?,0,?)',(filename,fhash,user['id'],len(parsed),now_iso()));batch=cur.lastrowid;inserted=0;dupes=0
             for item in parsed:
-                tenant,ch,event_id,order_id,typ,on,product,amount,discount,tax,payment,settlement=item
+                tenant,ch,event_id,order_id,typ,on,product,quantity,amount,discount,tax,payment,settlement=item
                 if not event_id:event_id=hashlib.sha256(json.dumps(item[2:],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-                try:self.insert_event(c,tenant,ch,event_id,order_id,typ,on,product,amount,discount,tax,payment,settlement,batch,user['id']);inserted+=1
+                try:self.insert_event(c,tenant,ch,event_id,order_id,typ,on,product,amount,discount,tax,payment,settlement,batch,user['id'],quantity);inserted+=1
                 except sqlite3.IntegrityError:
                     dupes+=1
             c.execute('UPDATE import_batches SET row_count=?,duplicate_count=? WHERE id=?',(inserted,dupes,batch));audit(c,user['id'],'sales.import','import_batch',batch,{'filename':filename,'rows':inserted,'duplicates':dupes,'sha256':fhash})
@@ -509,13 +600,27 @@ class App:
     def csv_response(self,start,rows,filename):
         safe_rows=[[("'"+v) if isinstance(v,str) and v[:1] in ('=','+','-','@','\t','\r') else v for v in row] for row in rows]
         buf=io.StringIO(newline='');w=csv.writer(buf);w.writerows(safe_rows);data='\ufeff'+buf.getvalue();return self.respond(start,'200 OK',data,[('Content-Type','text/csv; charset=utf-8'),('Content-Disposition',f'attachment; filename="{filename}"')])
-    def get_csv(self,path,user,start):
+    def get_csv(self,path,user,start,query_string=''):
         if path=='/payouts.csv': self.require(user,'admin','finance')
+        if path in ('/reports/items.csv','/reports/daily.csv','/reports/monthly.csv'):
+            filters=self.report_filters(user,query_string)
+            _,items,daily,monthly=self.report_data(filters)
+            if path.endswith('/items.csv'):
+                headers=['tenant','channel','product','sales_events','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+                item_columns=['tenant','channel','product','sales_count','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+                rows=[[r[k] for k in item_columns] for r in items]
+                return self.csv_response(start,[headers,*rows],'item-sales-report.csv')
+            periods=daily if path.endswith('/daily.csv') else monthly
+            headers=['period','sales_events','reversal_events','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+            period_columns=['period','sales_count','reversals_count','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+            rows=[[r[k] for k in period_columns] for r in periods]
+            filename='daily-sales-report.csv' if path.endswith('/daily.csv') else 'monthly-sales-report.csv'
+            return self.csv_response(start,[headers,*rows],filename)
         with conn() as c:
             if path=='/sales.csv':
-                q='SELECT e.event_key,e.order_id,e.event_type,e.occurred_on,t.name,ch.name,e.product,e.gross_amount,e.discount_amount,e.tax_amount,e.payment_method,e.settlement_ref FROM sale_events e JOIN tenants t ON t.id=e.tenant_id JOIN channels ch ON ch.id=e.channel_id';a=()
+                q='SELECT e.event_key,e.order_id,e.event_type,e.occurred_on,t.name,ch.name,e.product,e.quantity,e.gross_amount,e.discount_amount,e.tax_amount,e.payment_method,e.settlement_ref FROM sale_events e JOIN tenants t ON t.id=e.tenant_id JOIN channels ch ON ch.id=e.channel_id';a=()
                 if user['role']=='tenant':q+=' WHERE e.tenant_id=?';a=(user['tenant_id'],)
-                rows=c.execute(q+' ORDER BY e.id',a).fetchall();return self.csv_response(start,[['event_id','order_id','event_type','date','tenant','channel','product','amount','discount','tax_amount','payment_method','settlement_ref'],*[list(r) for r in rows]],'sales-ledger.csv')
+                rows=c.execute(q+' ORDER BY e.id',a).fetchall();return self.csv_response(start,[['event_id','order_id','event_type','date','tenant','channel','product','quantity','amount','discount','tax_amount','payment_method','settlement_ref'],*[list(r) for r in rows]],'sales-ledger.csv')
             if path=='/payouts.csv':
                 q='SELECT p.settlement_ref,p.settlement_date,ch.name,p.expected_amount,p.received_amount,p.provider_fee,p.bank_ref FROM payout_records p JOIN channels ch ON ch.id=p.channel_id';a=()
                 if user['role']=='tenant':q+=' WHERE EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=p.channel_id AND e.tenant_id=?)';a=(user['tenant_id'],)
