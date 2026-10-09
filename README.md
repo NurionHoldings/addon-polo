@@ -54,7 +54,7 @@
 
 공개 안내 홈은 `public/index.html`에 있습니다. 로그인하면 운영자는 `/admin`의 관리자 전용 운영실에서 업체·채널 등록, 정산 차이, 미수 명세와 최근 변경 이력을 확인할 수 있습니다. `/admin` 권한은 화면 버튼 숨김이 아니라 서버에서 `admin` 역할을 확인합니다.
 
-Netlify는 공개 홈과 요청 프록시로 사용합니다. 현재 원장 앱은 Python WSGI와 SQLite이므로 영구 저장소가 있는 컨테이너 서버도 함께 필요합니다. 배포 변수 설정과 검증 순서는 [Netlify 배포 준비](docs/netlify-deployment.md)를 확인하세요. Python 운영 서버 주소가 설정되기 전에는 로그인/관리자 요청을 공개하지 않습니다.
+Netlify는 공개 홈과 요청 프록시로 사용합니다. 현재 원장 앱은 Python WSGI와 SQLite이므로 영구 저장소가 있는 컨테이너 서버도 함께 필요합니다. 배포 변수 설정과 검증 순서는 [Netlify 배포 준비](docs/netlify-deployment.md)를 확인하세요. Python 운영 서버 주소가 설정되기 전에는 로그인/관리자 요청을 공개하지 않습니다. Netlify 프로젝트는 GitHub 저장소의 `main`만 운영 배포하고, 일반 브랜치 배포는 끈 채 PR마다 Deploy Preview를 생성하도록 설정되어 있습니다. PR 미리보기 주소에서 화면과 프록시 응답을 확인한 뒤 GitHub에서 PR을 병합해야 운영 사이트가 갱신됩니다.
 
 ## CSV 형식
 
