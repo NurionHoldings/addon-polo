@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""Onbuilding tenant sales ledger. Python standard library WSGI + SQLite."""
+from __future__ import annotations
+import argparse, csv, datetime as dt, hashlib, hmac, html, io, json, os, secrets, sqlite3, sys, time, uuid
+from email.parser import BytesParser
+from email.policy import default
+from http import cookies
+from urllib.parse import parse_qs, urlencode
+from wsgiref.simple_server import make_server
+
+ROOT=os.path.dirname(os.path.abspath(__file__))
+DATA_DIR=os.environ.get('DATA_DIR',ROOT)
+DB_PATH=os.environ.get('DATABASE_PATH',os.path.join(DATA_DIR,'onbuilding.sqlite3'))
+SESSION_NAME='onbuilding_session'
+SESSION_SECONDS=8*60*60
+COOKIE_SECURE=os.environ.get('COOKIE_SECURE','0')=='1'
+VAT_RATE=10
+
+SCHEMA='''
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS tenants(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, business_no TEXT NOT NULL DEFAULT '', manager TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', fee_rate TEXT NOT NULL DEFAULT '10.00', vat_mode TEXT NOT NULL DEFAULT 'taxable' CHECK(vat_mode IN ('taxable','exempt','mixed')), bank_account TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, channel_type TEXT NOT NULL, ingest_mode TEXT NOT NULL DEFAULT 'csv', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','finance','tenant')), tenant_id INTEGER REFERENCES tenants(id), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id), csrf TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS login_failures(username_key TEXT NOT NULL, attempted_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS import_batches(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, filename TEXT NOT NULL, file_hash TEXT NOT NULL, imported_by INTEGER REFERENCES users(id), row_count INTEGER NOT NULL, duplicate_count INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind,file_hash));
+CREATE TABLE IF NOT EXISTS sale_events(id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL REFERENCES tenants(id), channel_id INTEGER NOT NULL REFERENCES channels(id), event_key TEXT NOT NULL, order_id TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('sale','refund','cancel')), occurred_on TEXT NOT NULL, product TEXT NOT NULL DEFAULT '', quantity INTEGER NOT NULL DEFAULT 1, gross_amount INTEGER NOT NULL, discount_amount INTEGER NOT NULL DEFAULT 0, tax_amount INTEGER NOT NULL DEFAULT 0, payment_method TEXT NOT NULL DEFAULT '', settlement_ref TEXT NOT NULL DEFAULT '', import_batch_id INTEGER REFERENCES import_batches(id), created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(channel_id,event_key));
+CREATE INDEX IF NOT EXISTS sale_period_idx ON sale_events(tenant_id,occurred_on);
+CREATE TABLE IF NOT EXISTS payout_records(id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL REFERENCES channels(id), settlement_ref TEXT NOT NULL, settlement_date TEXT NOT NULL, expected_amount INTEGER NOT NULL DEFAULT 0, received_amount INTEGER NOT NULL DEFAULT 0, provider_fee INTEGER NOT NULL DEFAULT 0, bank_ref TEXT NOT NULL DEFAULT '', created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(channel_id,settlement_ref));
+CREATE TABLE IF NOT EXISTS statements(id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL REFERENCES tenants(id), period TEXT NOT NULL, fee_rate TEXT NOT NULL, basis_amount INTEGER NOT NULL, fee_amount INTEGER NOT NULL, vat_amount INTEGER NOT NULL, total_amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'issued' CHECK(status IN ('issued','paid')), generated_by INTEGER REFERENCES users(id), generated_at TEXT NOT NULL, paid_at TEXT, UNIQUE(tenant_id,period));
+CREATE TABLE IF NOT EXISTS statement_lines(id INTEGER PRIMARY KEY, statement_id INTEGER NOT NULL REFERENCES statements(id), sale_event_id INTEGER NOT NULL REFERENCES sale_events(id), included_amount INTEGER NOT NULL, UNIQUE(statement_id,sale_event_id));
+CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY, actor_id INTEGER REFERENCES users(id), action TEXT NOT NULL, object_type TEXT NOT NULL, object_id TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+'''
+
+def now_iso(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+def today_kst(): return dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+def conn():
+    os.makedirs(os.path.dirname(DB_PATH) or '.',exist_ok=True)
+    c=sqlite3.connect(DB_PATH,timeout=20)
+    c.row_factory=sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON')
+    c.execute('PRAGMA journal_mode=WAL')
+    return c
+
+def init_db():
+    with conn() as c:
+        c.executescript(SCHEMA)
+        columns={r['name'] for r in c.execute('PRAGMA table_info(sale_events)')}
+        if 'quantity' not in columns:
+            c.execute('ALTER TABLE sale_events ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1')
+            # Legacy rows did not store signed quantities. Reversals must be negative.
+            c.execute("UPDATE sale_events SET quantity=-1 WHERE event_type IN ('refund','cancel')")
+def audit(c, actor, action, kind, oid, details=None):
+    c.execute('INSERT INTO audit_log(actor_id,action,object_type,object_id,detail_json,created_at) VALUES(?,?,?,?,?,?)',(actor,action,kind,str(oid),json.dumps(details or {},ensure_ascii=False,sort_keys=True),now_iso()))
+def password_hash(password, salt=None):
+    salt=salt or secrets.token_hex(16)
+    derived=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),310000).hex()
+    return f'pbkdf2_sha256$310000${salt}${derived}'
+def password_ok(password, encoded):
+    try:
+        alg,iterations,salt,expected=encoded.split('$')
+        actual=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),int(iterations)).hex()
+        return alg=='pbkdf2_sha256' and hmac.compare_digest(actual,expected)
+    except Exception: return False
+
+def create_user(username,password,role='admin',tenant_id=None):
+    if len(password)<12: raise ValueError('비밀번호는 12자 이상이어야 합니다.')
+    if role=='tenant' and not tenant_id: raise ValueError('입점업체 계정에는 tenant_id가 필요합니다.')
+    with conn() as c:
+        cur=c.execute('INSERT INTO users(username,password_hash,role,tenant_id,created_at) VALUES(?,?,?,?,?)',(username,password_hash(password),role,tenant_id,now_iso()))
+        audit(c,cur.lastrowid,'user.create','user',cur.lastrowid,{'username':username,'role':role,'tenant_id':tenant_id})
+
+def esc(v): return html.escape(str(v if v is not None else ''),quote=True)
+def won(v): return f'{int(v or 0):,}원'
+def page(title, body, user=None, active='dashboard', csrf=''):
+    menus={
+        'admin':[('admin','관리자 홈'),('dashboard','운영 대시보드'),('reports','매출 보고서'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비'),('tenants','입점업체'),('channels','판매 채널'),('audit','감사 이력')],
+        'finance':[('dashboard','대시보드'),('reports','매출 보고서'),('sales','매출 원장'),('reconcile','입금 대사'),('settlements','수수료 정산'),('arkaon','아르카온 분석'),('connectors','연동 준비')],
+        'tenant':[('dashboard','내 현황'),('reports','내 매출 보고서'),('sales','내 매출'),('settlements','수수료 명세'),('arkaon','아르카온 분석')],
+    }
+    links=menus.get(user['role'],[]) if user else []
+    nav=''.join(f'<a class="{("active" if key==active else "")}" href="/{key}">{label}</a>' for key,label in links)
+    who=f'{esc(user["username"])} · {esc(user["role"])}' if user else '로그인 필요'
+    logout=f'<form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(csrf)}"><button class="link">로그아웃</button></form>' if user else ''
+    motion_script='''<script>(()=>{const b=document.querySelector('[data-motion-toggle]');if(!b)return;const mq=window.matchMedia('(prefers-reduced-motion: reduce)');let off=false;const update=()=>{document.documentElement.classList.toggle('motion-off',off||mq.matches);b.disabled=mq.matches;b.textContent=mq.matches?'기기 설정에 따라 정지':off?'로고 움직임 켜기':'로고 움직임 끄기';b.setAttribute('aria-label',b.textContent);b.setAttribute('aria-pressed',String(off||mq.matches))};b.addEventListener('click',()=>{if(mq.matches)return;off=!off;update()});mq.addEventListener?.('change',update);update()})();</script>'''
+    return f'''<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} | 누리온 세일즈허브 · 아세아홀딩스</title><style>
+:root{{--navy:#13223d;--blue:#4969e8;--bg:#f4f6fa;--line:#e5e9f0;--muted:#78849a;--text:#202b3e;--green:#13865f;--red:#bd454d}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:14px/1.5 system-ui,"Noto Sans KR",sans-serif;color:var(--text)}}header{{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 max(20px,calc((100vw - 1320px)/2));position:sticky;top:0;z-index:2}}.brand{{display:flex;align-items:center;gap:10px;font-weight:850;color:var(--navy);font-size:16px;text-decoration:none}}.brand-mark{{position:relative;width:40px;height:40px;flex:none}}.brand-mark img{{display:block;width:100%;height:100%;border-radius:12px}}.brand-orbit{{position:absolute;inset:-3px;border:1px solid #78a99e88;border-radius:50%;animation:brand-orbit 13s linear infinite;pointer-events:none}}.brand-orbit:after{{content:"";position:absolute;top:2px;left:50%;width:6px;height:6px;border-radius:50%;background:#86cbb8;box-shadow:0 0 8px #86cbb8;transform:translateX(-50%)}}@keyframes brand-orbit{{to{{transform:rotate(1turn)}}}}.brand-copy{{display:grid;gap:0}}.brand-copy small{{font-size:10px;letter-spacing:.7px;color:var(--muted);font-weight:750}}.brand-copy strong{{font-size:14px;color:var(--navy)}}.motion-toggle{{border:1px solid var(--line);background:#f3f3ef;color:#4c5868;border-radius:8px;padding:7px 9px;font:inherit;font-size:11px;cursor:pointer}}.motion-toggle:focus-visible{{outline:3px solid #8397b4;outline-offset:2px}}.motion-off .brand-orbit{{animation:none}}@media(prefers-reduced-motion:reduce){{.brand-orbit{{animation:none}}}}.user{{display:flex;gap:16px;align-items:center;color:var(--muted);font-size:12px}}.link{{background:none;border:0;color:var(--blue);cursor:pointer}}nav{{display:flex;gap:4px;overflow:auto;padding:12px max(14px,calc((100vw - 1320px)/2));background:var(--navy)}}nav a{{color:#c5d0e1;text-decoration:none;padding:8px 12px;border-radius:8px;white-space:nowrap;font-size:12px}}nav a.active,nav a:hover{{background:#263a5b;color:white}}main{{max-width:1320px;margin:26px auto;padding:0 18px 55px}}h1{{font-size:24px;letter-spacing:-.5px;margin:0 0 4px}}h2{{font-size:16px;margin:0 0 14px}}.sub{{color:var(--muted);font-size:12px;margin-bottom:20px}}.row{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}}.card,.panel{{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 2px 8px #1b31540b}}.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}}.metric small{{color:var(--muted)}}.metric strong{{display:block;font-size:23px;margin-top:8px}}.grid{{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;margin-bottom:15px}}.btn{{display:inline-block;border:1px solid #dce2ec;background:white;color:#33425b;text-decoration:none;border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:650;font-size:12px}}.btn.primary{{background:var(--blue);color:#fff;border-color:var(--blue)}}input,select,textarea{{font:inherit;border:1px solid #dbe1eb;border-radius:7px;padding:9px 10px;background:#fff;max-width:100%}}label{{display:block;font-size:11px;font-weight:700;color:#637086;margin:10px 0 5px}}form.inline{{display:flex;gap:8px;align-items:end;flex-wrap:wrap}}.tablewrap{{overflow:auto}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th{{background:#f8f9fb;color:#768298;text-align:left;font-size:10px;padding:10px;border-bottom:1px solid var(--line)}}td{{font-size:11px;padding:10px;border-bottom:1px solid #edf0f4}}.right{{text-align:right}}.badge{{display:inline-block;background:#e9f5ef;color:#137d5c;padding:3px 8px;border-radius:20px;font-size:10px}}.warn{{background:#fff4df;color:#a96c0e}}.bad{{background:#ffeded;color:#b33e48}}.note{{background:#fff8e8;color:#805d19;border-radius:8px;padding:11px 13px;font-size:11px;margin-top:12px}}.error{{background:#fff0f0;color:#a4303b;padding:10px;border-radius:8px;margin:12px 0;font-size:12px}}.success{{background:#eaf7f1;color:#176c52;padding:10px;border-radius:8px;margin:12px 0;font-size:12px}}.formgrid{{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 12px}}.small{{font-size:10px;color:var(--muted)}}.spacer{{height:14px}}.login{{max-width:440px;margin:80px auto}}.danger{{color:var(--red)}}@media(max-width:800px){{.cards{{grid-template-columns:repeat(2,1fr)}}.grid{{grid-template-columns:1fr}}.formgrid{{grid-template-columns:1fr 1fr}}main{{margin-top:18px}}}}@media(max-width:520px){{.brand-mark{{width:34px;height:34px}}.brand-copy strong{{font-size:12px}}.motion-toggle{{font-size:0;width:34px;padding:7px}}.motion-toggle:before{{content:"◌";font-size:16px}}.user{{gap:7px;font-size:11px}}.cards{{grid-template-columns:1fr 1fr;gap:8px}}.metric strong{{font-size:17px}}header{{padding:0 14px}}.formgrid{{grid-template-columns:1fr}}}}
+.admin-hero{{background:linear-gradient(120deg,#12213b,#203969 70%,#3e55a5);border-radius:18px;padding:30px;color:white;display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:18px}}.admin-hero h1{{font-size:29px;margin:8px 0}}.admin-hero p{{margin:0;color:#d5def0}}.eyebrow{{font-size:10px;letter-spacing:1.5px;color:#a8bbff;font-weight:800}}.btn.light{{background:white;color:#24375d;border-color:white}}.admin-cards{{grid-template-columns:repeat(5,1fr)}}.admin-cards .metric{{padding:16px}}.admin-cards .metric strong{{font-size:20px}}.admin-actions{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}.action-card{{border:1px solid var(--line);border-radius:10px;padding:16px;text-decoration:none;color:var(--text);display:flex;flex-direction:column;min-height:140px;transition:transform .18s,border-color .18s}}.action-card:hover{{transform:translateY(-2px);border-color:#8799e8}}.action-card b{{font-size:14px}}.action-card span{{font-size:11px;color:var(--muted);margin:8px 0 14px}}.action-card em{{font-size:11px;font-style:normal;color:var(--blue);font-weight:700;margin-top:auto}}.checklist{{list-style:none;padding:0;margin:0}}.checklist li{{display:flex;gap:12px;padding:12px 0;border-bottom:1px solid #edf0f4}}.checklist li:last-child{{border:0}}.checklist li>span{{font-size:12px;font-weight:800;color:var(--blue)}}.checklist b,.checklist small{{display:block}}.checklist small{{font-size:11px;color:var(--muted);margin-top:4px}}@media(max-width:900px){{.admin-cards{{grid-template-columns:repeat(3,1fr)}}.admin-actions{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:560px){{.admin-hero{{align-items:flex-start;flex-direction:column;padding:22px}}.admin-cards{{grid-template-columns:repeat(2,1fr)}}.admin-actions{{grid-template-columns:1fr 1fr}}.action-card{{min-height:160px;padding:13px}}}}
+
+/* Long-session comfort shared by administrator and staff workspaces. */
+:root{{--navy:#344357;--blue:#536d98;--bg:#f1f1ed;--line:#e2e3df;--muted:#5c6672;--text:#29323d;--green:#28775e;--red:#a94d52}}
+body{{background:#f1f1ed;font-size:15px;line-height:1.6;color:#29323d}}
+header{{background:#f8f7f3}}
+nav{{background:#344357}}nav a{{color:#e0e5eb}}nav a.active,nav a:hover{{background:#4a5a6d;color:#fff}}
+.card,.panel{{background:#fbfaf7;border-color:#e2e3df;box-shadow:0 2px 8px rgba(37,48,62,.035)}}
+.btn{{background:#fbfaf7}}.btn.primary{{background:#536d98;border-color:#536d98}}
+input,select,textarea{{background:#fbfaf7;border-color:#d9dcd9}}
+th{{background:#f1f1ed;color:#596574}}td{{border-color:#e9e9e5}}
+.badge{{background:#e8efe9;color:#32654f}}.warn{{background:#f4eedf;color:#795d26}}.bad,.error{{background:#f6e9e8;color:#874449}}.note{{background:#f5f0e3;color:#66572f}}
+.admin-hero{{background:linear-gradient(120deg,#344357,#43566d 72%,#586c83)}}.admin-hero p{{color:#e1e6eb}}.eyebrow{{color:#d0d9e5}}
+.small{{font-size:11px;color:#5c6672}}.sub{{color:#5c6672}}th{{font-size:11px}}td{{font-size:12px}}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{{outline:3px solid #8397b4;outline-offset:2px}}
+@media(prefers-reduced-motion:reduce){{*,*::before,*::after{{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}}}
+
+/* Reading comfort refinements for dense operational screens. */
+body{{font-family:Pretendard,"Noto Sans KR",system-ui,-apple-system,sans-serif;line-height:1.65}}
+.btn,.small,.sub,.note,.error,.success,.user,nav a,th,td,label,.badge{{font-size:12px}}
+main{{margin-top:30px}}.card,.panel{{padding:20px}}
+th{{padding:13px 12px}}td{{padding:14px 12px}}
+.report-stats{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}}.report-stats .card{{padding:15px}}.report-stats small{{display:block;color:var(--muted)}}.report-stats strong{{display:block;font-size:20px;margin-top:6px}}.report-section{{margin-top:16px}}.report-section h2{{margin:0}}.report-actions{{display:flex;gap:8px;flex-wrap:wrap}}.report-filters{{display:flex;gap:10px;align-items:end;flex-wrap:wrap}}.report-filters label{{margin:0}}.report-table{{min-width:760px}}.report-table .right{{font-variant-numeric:tabular-nums}}.print-only{{display:none}}.report-note{{font-size:12px;color:#4f5c69;background:#f2f1eb;border-left:3px solid #8e9caf;padding:12px 14px;border-radius:6px;margin-top:14px}}
+@media print{{@page{{size:landscape;margin:12mm}}body{{background:#fff!important;color:#111;font-size:10pt}}header,nav,.report-controls,.motion-toggle,.report-actions{{display:none!important}}main{{max-width:none;margin:0;padding:0}}.report-section{{break-inside:auto;margin-top:10mm}}.report-section h2{{break-after:avoid}}.tablewrap{{overflow:visible}}.panel,.card{{box-shadow:none!important;border:1px solid #aaa!important;background:#fff!important}}.report-stats{{grid-template-columns:repeat(5,1fr)}}.report-stats .card{{padding:8px}}.report-table{{min-width:0;white-space:normal}}.report-table th,.report-table td{{font-size:8pt;padding:5px}}.report-table tr{{break-inside:avoid}}.print-only{{display:block}}a{{color:#111;text-decoration:none}}}}
+</style></head><body><header><a class="brand" href="/" aria-label="아세아홀딩스 누리온 세일즈허브 홈"><span class="brand-mark"><img src="/nurion-logo.svg" alt=""><i class="brand-orbit"></i></span><span class="brand-copy"><small>아세아홀딩스</small><strong>누리온 세일즈허브</strong></span></a><div class="user"><button class="motion-toggle" type="button" data-motion-toggle aria-label="로고 애니메이션 끄기">로고 움직임 끄기</button>{who}{logout}</div></header>{f'<nav>{nav}</nav>' if nav else ''}<main>{body}</main>{motion_script}</body></html>'''
+
+def public_home_page():
+    try:
+        with open(os.path.join(ROOT,'public','index.html'),encoding='utf-8') as f:return f.read()
+    except OSError:
+        return '<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>누리온 세일즈허브 | 아세아홀딩스</title><main><h1>누리온 세일즈허브</h1><a href="/login">운영자 로그인</a></main></html>'
+
+def login_page(message='', csrf='', next_path='/dashboard'):
+    safe_next='/admin' if next_path=='/admin' else '/dashboard'
+    return page('로그인',f'''<section class="login panel"><h1>운영자 로그인</h1><p class="sub">매출·정산 자료는 권한이 있는 사용자만 볼 수 있습니다.</p>{message}<form method="post" action="/login"><input type="hidden" name="csrf" value="{esc(csrf)}"><input type="hidden" name="next" value="{safe_next}"><label>아이디</label><input name="username" autocomplete="username" required style="width:100%"><label>비밀번호</label><input name="password" type="password" autocomplete="current-password" required style="width:100%"><div class="spacer"></div><button class="btn primary" style="width:100%">로그인</button></form></section>''')
+
+class App:
+    def __init__(self): init_db()
+    def __call__(self,environ,start_response):
+        path=environ.get('PATH_INFO','/')
+        method=environ.get('REQUEST_METHOD','GET').upper()
+        session,user,csrf,new_cookie=self.session_for(environ)
+        try:
+            if path=='/health': return self.respond(start_response,'200 OK','ok', [('Content-Type','text/plain; charset=utf-8')],new_cookie)
+            if path=='/nurion-logo.svg' and method=='GET':
+                with open(os.path.join(ROOT,'public','nurion-logo.svg'),encoding='utf-8') as f: logo=f.read()
+                return self.respond(start_response,'200 OK',logo,[('Content-Type','image/svg+xml; charset=utf-8')],new_cookie=new_cookie)
+            if path=='/' and method=='GET': return self.html(start_response,public_home_page(),'200 OK',new_cookie=new_cookie)
+            if path=='/login' and method=='POST':
+                data=self.form(environ);self.check_csrf(data,csrf)
+                with conn() as c:
+                    username=data.get('username','').strip()
+                    username_key=hashlib.sha256(username.casefold().encode()).hexdigest()
+                    cutoff=int(time.time())-900
+                    failures=c.execute('SELECT COUNT(*) n FROM login_failures WHERE username_key=? AND attempted_at>?',(username_key,cutoff)).fetchone()['n']
+                    u=c.execute('SELECT * FROM users WHERE username=? AND active=1',(username,)).fetchone()
+                    if failures>=10 or not u or not password_ok(data.get('password',''),u['password_hash']):
+                        c.execute('INSERT INTO login_failures(username_key,attempted_at) VALUES(?,?)',(username_key,int(time.time())))
+                        return self.html(start_response,login_page('<div class="error">아이디 또는 비밀번호를 확인해 주세요.</div>',csrf),'200 OK',new_cookie=new_cookie)
+                    c.execute('DELETE FROM login_failures WHERE username_key=?',(username_key,))
+                    raw=secrets.token_urlsafe(32);c.execute('DELETE FROM sessions WHERE token_hash=?',(session,));c.execute('INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES(?,?,?,?)',(hashlib.sha256(raw.encode()).hexdigest(),u['id'],secrets.token_urlsafe(24),int(time.time())+SESSION_SECONDS));audit(c,u['id'],'auth.login','user',u['id'])
+                    destination='/admin' if data.get('next')=='/admin' and u['role']=='admin' else '/dashboard'
+                    start_response('303 See Other',[('Location',destination),('Set-Cookie',self.cookie(raw)) ,('Cache-Control','no-store')]);return [b'']
+            if path=='/logout' and method=='POST':
+                self.check_csrf(self.form(environ),csrf)
+                with conn() as c:c.execute('DELETE FROM sessions WHERE token_hash=?',(session,))
+                start_response('303 See Other',[('Location','/login'),('Set-Cookie',self.cookie('',max_age=0)),('Cache-Control','no-store')]);return [b'']
+            if not user:
+                if path=='/login':
+                    requested=parse_qs(environ.get('QUERY_STRING','')).get('next',['/dashboard'])[0]
+                    return self.html(start_response,login_page(csrf=csrf,next_path=requested),'200 OK',new_cookie=new_cookie)
+                if path=='/admin':
+                    start_response('303 See Other',[('Location','/login?next=/admin'),('Cache-Control','no-store')]);return [b'']
+                start_response('303 See Other',[('Location','/login'),('Cache-Control','no-store')]);return [b'']
+            if method=='POST':
+                data=self.form(environ)
+                self.check_csrf(data,csrf)
+                return self.post(path,data,user,start_response,csrf)
+            if method!='GET': return self.error(start_response,'405 Method Not Allowed','지원하지 않는 요청입니다.',user,csrf)
+            if path.endswith('.csv'):
+                return self.get_csv(path,user,start_response,environ.get('QUERY_STRING',''))
+            routes={'/admin':self.admin_console,'/dashboard':self.dashboard,'/reports':self.reports,'/sales':self.sales,'/reconcile':self.reconcile,'/settlements':self.settlements,'/arkaon':self.arkaon_analysis,'/connectors':self.connectors_page,'/tenants':self.tenants,'/channels':self.channels,'/audit':self.audit_page}
+            if path not in routes:return self.error(start_response,'404 Not Found','요청한 화면을 찾지 못했습니다.',user,csrf)
+            if path=='/reports':
+                body=routes[path](user,csrf,environ.get('QUERY_STRING',''))
+            elif path=='/settlements':
+                selected=parse_qs(environ.get('QUERY_STRING','')).get('period',[''])[0]
+                if selected:
+                    try:dt.date.fromisoformat(selected+'-01')
+                    except ValueError:raise ValueError('정산월 형식은 YYYY-MM이어야 합니다.')
+                body=routes[path](user,csrf,selected or None)
+            else:body=routes[path](user,csrf)
+            return self.html(start_response,body,user=user,csrf=csrf,new_cookie=new_cookie)
+        except PermissionError as e:return self.error(start_response,'403 Forbidden',str(e),user,csrf)
+        except ValueError as e:return self.error(start_response,'400 Bad Request',str(e),user,csrf)
+        except Exception as e:
+            print('request error:',repr(e),file=sys.stderr)
+            return self.error(start_response,'500 Internal Server Error','처리 중 오류가 발생했습니다. 입력 파일과 필수 항목을 확인해 주세요.',user,csrf)
+    def cookie(self,value,max_age=SESSION_SECONDS):
+        return f'{SESSION_NAME}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}'+('; Secure' if COOKIE_SECURE else '')
+    def session_for(self,env):
+        jar=cookies.SimpleCookie();jar.load(env.get('HTTP_COOKIE',''));raw=jar[SESSION_NAME].value if SESSION_NAME in jar else ''
+        token=hashlib.sha256(raw.encode()).hexdigest() if raw else ''
+        with conn() as c:
+            row=c.execute('SELECT s.csrf,s.expires_at,u.* FROM sessions s LEFT JOIN users u ON u.id=s.user_id WHERE s.token_hash=?',(token,)).fetchone() if token else None
+            if row and row['expires_at']>int(time.time()):return token,dict(row) if row['username'] else None,row['csrf'],None
+            if token:c.execute('DELETE FROM sessions WHERE token_hash=?',(token,))
+            raw=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(24);token=hashlib.sha256(raw.encode()).hexdigest();c.execute('INSERT INTO sessions(token_hash,csrf,expires_at) VALUES(?,?,?)',(token,csrf,int(time.time())+SESSION_SECONDS))
+            return token,None,csrf,self.cookie(raw)
+    def respond(self,start,status,body,headers=None,new_cookie=None):
+        b=body.encode('utf-8') if isinstance(body,str) else body
+        hs=[('Content-Length',str(len(b))),('X-Content-Type-Options','nosniff'),('Referrer-Policy','same-origin'),('X-Frame-Options','DENY'),('Cache-Control','no-store')]+(headers or [])
+        if new_cookie:hs.append(('Set-Cookie',new_cookie))
+        start(status,hs);return [b]
+    def html(self,start,body,status='200 OK',user=None,csrf='',new_cookie=None):return self.respond(start,status,body,[('Content-Type','text/html; charset=utf-8')],new_cookie)
+    def error(self,start,status,msg,user,csrf):return self.html(start,page('알림',f'<h1>요청을 처리하지 못했습니다</h1><div class="error">{esc(msg)}</div><a class="btn" href="/dashboard">대시보드</a>',user,csrf=csrf),status,user=user,csrf=csrf)
+    def form(self,env):
+        try:n=int(env.get('CONTENT_LENGTH') or 0)
+        except ValueError:n=0
+        if n>6_000_000:raise ValueError('파일은 6MB 이하로 제한됩니다.')
+        body=env['wsgi.input'].read(n)
+        ctype=env.get('CONTENT_TYPE','')
+        if 'multipart/form-data' in ctype:
+            msg=BytesParser(policy=default).parsebytes(b'Content-Type: '+ctype.encode()+b'\r\nMIME-Version: 1.0\r\n\r\n'+body)
+            out={}
+            for part in msg.iter_parts():
+                name=part.get_param('name',header='content-disposition')
+                if not name:continue
+                payload=part.get_payload(decode=True) or b''
+                if part.get_filename():out[name+'_filename']=part.get_filename();out[name]=payload.decode('utf-8-sig',errors='replace')
+                else:out[name]=payload.decode(part.get_content_charset() or 'utf-8',errors='replace')
+            return out
+        return {k:v[-1] for k,v in parse_qs(body.decode('utf-8',errors='replace'),keep_blank_values=True).items()}
+    def check_csrf(self,data,csrf):
+        if not csrf or not hmac.compare_digest(str(data.get('csrf','')),str(csrf)):raise PermissionError('보안 토큰이 만료되었습니다. 새로고침 후 다시 시도해 주세요.')
+    def require(self,user,*roles):
+        if not user or user['role'] not in roles:raise PermissionError('이 기능을 사용할 권한이 없습니다.')
+    def scoped(self,user,sql,args=()):
+        if user['role']=='tenant':return sql+' AND s.tenant_id=?',tuple(args)+(user['tenant_id'],)
+        return sql,args
+    def dashboard(self,user,csrf):
+        with conn() as c:
+            where='WHERE event_type IN ("sale","refund","cancel")';args=()
+            if user['role']=='tenant':where+=' AND tenant_id=?';args=(user['tenant_id'],)
+            today=today_kst().isoformat();s=c.execute(f'SELECT COALESCE(SUM(gross_amount),0) gross,COALESCE(SUM(tax_amount),0) tax,COUNT(*) n FROM sale_events {where} AND occurred_on=?',args+(today,)).fetchone()
+            unpaid={'amt':0,'n':0} if user['role']=='tenant' else c.execute('SELECT COALESCE(SUM(MAX(expected_amount-received_amount,0)),0) amt,COUNT(*) n FROM payout_records WHERE expected_amount<>received_amount').fetchone()
+            recent_sql='SELECT s.*,t.name tenant,ch.name channel FROM sale_events s JOIN tenants t ON t.id=s.tenant_id JOIN channels ch ON ch.id=s.channel_id WHERE 1=1';recent_args=()
+            if user['role']=='tenant':recent_sql+=' AND s.tenant_id=?';recent_args=(user['tenant_id'],)
+            recent=c.execute(recent_sql+' ORDER BY s.id DESC LIMIT 8',recent_args).fetchall()
+            fee=float(c.execute('SELECT fee_rate FROM tenants WHERE id=?',(user['tenant_id'],)).fetchone()['fee_rate']) if user['role']=='tenant' else 10
+            exp=c.execute('SELECT COUNT(*) n FROM payout_records WHERE expected_amount<>received_amount').fetchone()['n'] if user['role']!='tenant' else unpaid['n']
+        base=int(s['gross']-s['tax']);feeamt=round(base*fee/100);blocks=''.join(f'<div class="card metric"><small>{label}</small><strong>{value}</strong></div>' for label,value in [('오늘 매출(결제·환불 순액)',won(s['gross'])),('오늘 수수료 예상',won(feeamt)),('입금 차액 대기',won(unpaid['amt'])),('확인할 대사 건',f'{exp}건')])
+        rows=''.join(self.sale_row(x) for x in recent) or '<tr><td colspan="10">거래 기록이 없습니다. 매출을 등록하거나 CSV를 가져오세요.</td></tr>'
+        body=f'<div class="row"><div><h1>통합 매출 대시보드</h1><div class="sub">주문 원장, 수수료와 입금 대사 현황</div></div><a class="btn primary" href="/sales">매출 원장 열기</a></div><div class="cards">{blocks}</div><div class="grid"><section class="panel"><h2>미대사 정산</h2>{self.recon_preview(user)}</section><section class="panel"><h2>정산 운영 상태</h2><p class="small">수수료율은 업체 계약 설정을 따릅니다. 월 마감 시점에 해당 월 정산 스냅샷을 생성하세요.</p><a class="btn" href="/settlements">정산 생성·조회</a><div class="note">원본 거래는 수정·삭제하지 않습니다. 환불은 별도 음수 거래로 등록되어 기존 매출과 이력이 보존됩니다.</div></section></div><section class="panel"><h2>최근 거래</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows}</tbody></table></div></section>'
+        return page('대시보드',body,user,'dashboard',csrf)
+    def admin_console(self,user,csrf):
+        self.require(user,'admin')
+        period=today_kst().strftime('%Y-%m')
+        first=dt.date.fromisoformat(period+'-01');next_month=(first.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+        with conn() as c:
+            tenants=c.execute('SELECT COUNT(*) n FROM tenants WHERE active=1').fetchone()['n']
+            channels=c.execute('SELECT COUNT(*) n FROM channels WHERE active=1').fetchone()['n']
+            sales=c.execute('SELECT COUNT(*) n,COALESCE(SUM(gross_amount),0) amount FROM sale_events WHERE occurred_on>=? AND occurred_on<?',(first.isoformat(),next_month.isoformat())).fetchone()
+            payout=c.execute('SELECT COUNT(*) n,COALESCE(SUM(MAX(expected_amount-received_amount,0)),0) amount FROM payout_records WHERE expected_amount<>received_amount').fetchone()
+            statements=c.execute('SELECT COUNT(*) n,COALESCE(SUM(total_amount),0) amount FROM statements WHERE status="issued"').fetchone()
+            recent=c.execute('SELECT a.created_at,u.username,a.action,a.object_type,a.object_id FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 6').fetchall()
+        cards=''.join(f'<article class="card metric"><small>{label}</small><strong>{value}</strong><span class="small">{detail}</span></article>' for label,value,detail in [
+            ('등록 입점업체',f'{tenants:,}개','활성 상태'),
+            ('운영 판매채널',f'{channels:,}개','POS·온라인·라이브 등'),
+            (f'{period} 원장 거래',f'{sales["n"]:,}건',f'거래 순액 {won(sales["amount"])}'),
+            ('미대사 정산',f'{payout["n"]:,}건',f'차액 합계 {won(payout["amount"])}'),
+            ('미수 수수료 명세',f'{statements["n"]:,}건',f'발행액 {won(statements["amount"])}'),
+        ])
+        recent_html=''.join(f'<tr><td>{esc(r["created_at"])}</td><td>{esc(r["username"] or "시스템")}</td><td>{esc(r["action"])}</td><td>{esc(r["object_type"])} #{esc(r["object_id"])}</td></tr>' for r in recent) or '<tr><td colspan="4">아직 기록된 변경이 없습니다.</td></tr>'
+        body=f'''<section class="admin-hero"><div><span class="eyebrow">OWNER CONSOLE · {esc(period)}</span><h1>관리자 전용 운영실</h1><p>입점업체, 판매 채널, 매출 원장, 정산 차이를 한곳에서 확인합니다.</p></div><a class="btn light" href="/audit">감사 이력 보기</a></section>
+        <div class="cards admin-cards">{cards}</div>
+        <section class="panel"><div class="row"><div><h2>바로가기</h2><div class="sub">운영 시작과 월 마감에 필요한 관리자 기능입니다.</div></div></div><div class="admin-actions"><a class="action-card" href="/tenants"><b>입점업체 관리</b><span>계약 수수료율과 과세 구분을 등록합니다.</span><em>업체 목록 열기 →</em></a><a class="action-card" href="/channels"><b>판매 채널 관리</b><span>POS, 라이브방송, 온라인 채널을 등록합니다.</span><em>채널 설정 열기 →</em></a><a class="action-card" href="/connectors"><b>외부 연동 준비</b><span>업체별 자료 규격과 협의할 항목을 확인합니다.</span><em>연동 준비 열기 →</em></a><a class="action-card" href="/settlements"><b>수수료 월 마감</b><span>월별 명세를 만들고 수납 상태를 기록합니다.</span><em>정산 화면 열기 →</em></a></div></section>
+        <div class="grid admin-grid"><section class="panel"><h2>관리자 점검 순서</h2><ol class="checklist"><li><span>01</span><div><b>입점 계약 등록</b><small>수수료율·과세 구분을 계약서와 맞춰 입력합니다.</small></div></li><li><span>02</span><div><b>판매 채널 준비</b><small>POS와 온라인·라이브 채널별 담당자와 자료 수집 방법을 확인합니다.</small></div></li><li><span>03</span><div><b>자료 대사 후 월 마감</b><small>누락·중복과 입금 차이를 확인한 뒤 수수료 명세를 생성합니다.</small></div></li></ol></section><section class="panel"><h2>최근 관리자 변경</h2><div class="tablewrap"><table><thead><tr><th>일시</th><th>사용자</th><th>작업</th><th>대상</th></tr></thead><tbody>{recent_html}</tbody></table></div><p class="small">관리자 변경은 감사 이력에 남습니다.</p></section></div>
+        <div class="note">이 페이지는 관리자 계정만 볼 수 있습니다. 정산 차이와 발행액은 현재 원장에 등록된 자료 기준이며, 자동 송금이나 자료의 자동 수정은 수행하지 않습니다.</div>'''
+        return page('관리자 전용',body,user,'admin',csrf)
+    def sale_head(self):return '<thead><tr><th>발생일</th><th>주문번호</th><th>업체</th><th>채널</th><th>유형</th><th>상품</th><th>수량</th><th>결제액</th><th>세액</th><th>결제수단</th></tr></thead>'
+    def sale_row(self,r):return f'<tr><td>{esc(r["occurred_on"])}</td><td>{esc(r["order_id"])}</td><td>{esc(r["tenant"])}</td><td>{esc(r["channel"])}</td><td>{esc(r["event_type"])}</td><td>{esc(r["product"] or "미지정 품목")}</td><td class="right">{r["quantity"]:,}</td><td class="right">{won(r["gross_amount"])}</td><td class="right">{won(r["tax_amount"])}</td><td>{esc(r["payment_method"])}</td></tr>'
+    def recon_preview(self,user):
+        if user['role']=='tenant': return '<p class="small">업체별 정산 입금 자료는 운영자 정산 화면에서 관리합니다.</p>'
+        with conn() as c:
+            q='SELECT p.*,ch.name channel FROM payout_records p JOIN channels ch ON ch.id=p.channel_id WHERE p.expected_amount<>p.received_amount'
+            a=()
+            if user['role']=='tenant':q+=' AND p.channel_id IN (SELECT channel_id FROM sale_events WHERE tenant_id=?)';a=(user['tenant_id'],)
+            rows=c.execute(q+' ORDER BY p.settlement_date DESC LIMIT 5',a).fetchall()
+        return '<div class="tablewrap"><table><tr><th>정산참조</th><th>채널</th><th>예정</th><th>입금</th></tr>'+''.join(f'<tr><td>{esc(r["settlement_ref"])}</td><td>{esc(r["channel"])}</td><td>{won(r["expected_amount"])}</td><td>{won(r["received_amount"])}</td></tr>' for r in rows)+'</table></div>' if rows else '<p class="small">미대사 자료가 없습니다.</p>'
+    def report_filters(self,user,query_string):
+        params=parse_qs(query_string,keep_blank_values=True)
+        today=today_kst();month_start=today.replace(day=1)
+        start=params.get('start',[''])[0] or month_start.isoformat()
+        end=params.get('end',[''])[0] or today.isoformat()
+        try:
+            start_date=dt.date.fromisoformat(start);end_date=dt.date.fromisoformat(end)
+        except ValueError:raise ValueError('조회일은 YYYY-MM-DD 형식으로 입력해 주세요.')
+        if start_date.isoformat()!=start or end_date.isoformat()!=end:raise ValueError('조회일은 YYYY-MM-DD 형식으로 입력해 주세요.')
+        if start_date>end_date:raise ValueError('시작일은 종료일보다 늦을 수 없습니다.')
+        tenant_id=user['tenant_id'] if user['role']=='tenant' else None
+        selected_tenant=params.get('tenant_id',[''])[0]
+        with conn() as c:
+            if user['role']!='tenant' and selected_tenant:
+                try:tenant_id=int(selected_tenant)
+                except ValueError:raise ValueError('업체 선택을 확인해 주세요.')
+                if not c.execute('SELECT 1 FROM tenants WHERE id=?',(tenant_id,)).fetchone():raise ValueError('등록된 업체를 찾지 못했습니다.')
+            channel_id=None
+            raw_channel=params.get('channel_id',[''])[0]
+            if raw_channel:
+                try:channel_id=int(raw_channel)
+                except ValueError:raise ValueError('채널 선택을 확인해 주세요.')
+                if not c.execute('SELECT 1 FROM channels WHERE id=?',(channel_id,)).fetchone():raise ValueError('등록된 채널을 찾지 못했습니다.')
+            tenants=c.execute('SELECT id,name FROM tenants WHERE id=? ORDER BY name',(user['tenant_id'],)).fetchall() if user['role']=='tenant' else c.execute('SELECT id,name FROM tenants WHERE active=1 ORDER BY name').fetchall()
+            channels=c.execute('SELECT id,name FROM channels WHERE active=1'+(' AND id IN (SELECT channel_id FROM sale_events WHERE tenant_id=?)' if user['role']=='tenant' else '')+' ORDER BY name',((user['tenant_id'],) if user['role']=='tenant' else ())).fetchall()
+        return {'start':start,'end':end,'tenant_id':tenant_id,'channel_id':channel_id,'tenants':tenants,'channels':channels}
+    def report_data(self,filters):
+        where=['e.occurred_on>=?','e.occurred_on<=?'];args=[filters['start'],filters['end']]
+        if filters['tenant_id'] is not None:where.append('e.tenant_id=?');args.append(filters['tenant_id'])
+        if filters['channel_id'] is not None:where.append('e.channel_id=?');args.append(filters['channel_id'])
+        source='FROM sale_events e JOIN tenants t ON t.id=e.tenant_id JOIN channels ch ON ch.id=e.channel_id WHERE '+' AND '.join(where)
+        sums='''COUNT(CASE WHEN e.event_type='sale' THEN 1 END) sales_count,
+        COUNT(CASE WHEN e.event_type IN ('refund','cancel') THEN 1 END) reversals_count,
+        SUM(CASE WHEN e.event_type='sale' THEN e.quantity ELSE 0 END) sold_quantity,
+        SUM(CASE WHEN e.event_type IN ('refund','cancel') THEN -e.quantity ELSE 0 END) returned_quantity,
+        SUM(e.quantity) net_quantity,
+        SUM(CASE WHEN e.event_type='sale' THEN e.gross_amount ELSE 0 END) sales_amount,
+        SUM(CASE WHEN e.event_type='refund' THEN -e.gross_amount ELSE 0 END) refund_amount,
+        SUM(CASE WHEN e.event_type='cancel' THEN -e.gross_amount ELSE 0 END) cancel_amount,
+        SUM(e.gross_amount) net_amount,
+        SUM(CASE WHEN t.vat_mode='exempt' THEN e.gross_amount ELSE e.gross_amount-e.tax_amount END) supply_amount,
+        SUM(e.tax_amount) tax_amount,
+        SUM(CASE WHEN e.event_type='sale' THEN e.discount_amount ELSE 0 END) discount_amount'''
+        with conn() as c:
+            totals=c.execute('SELECT '+sums+' '+source,args).fetchone()
+            items=c.execute('SELECT t.name tenant,ch.name channel,COALESCE(NULLIF(TRIM(e.product),\'\'),\'미지정 품목\') product,'+sums+' '+source+' GROUP BY t.id,ch.id,COALESCE(NULLIF(TRIM(e.product),\'\'),\'미지정 품목\') ORDER BY net_amount DESC,product,t.name,ch.name',args).fetchall()
+            daily=c.execute('SELECT e.occurred_on period,'+sums+' '+source+' GROUP BY e.occurred_on ORDER BY e.occurred_on',args).fetchall()
+            monthly=c.execute("SELECT substr(e.occurred_on,1,7) period,"+sums+' '+source+" GROUP BY substr(e.occurred_on,1,7) ORDER BY period",args).fetchall()
+        return totals,items,daily,monthly
+    def reports(self,user,csrf,query_string=''):
+        filters=self.report_filters(user,query_string)
+        totals,items,daily,monthly=self.report_data(filters)
+        tenant_names={r['id']:r['name'] for r in filters['tenants']}
+        tenant_label=tenant_names.get(filters['tenant_id'],'전체 업체') if filters['tenant_id'] is not None else '전체 업체'
+        channel_names={r['id']:r['name'] for r in filters['channels']}
+        channel_label=channel_names.get(filters['channel_id'],'전체 채널') if filters['channel_id'] is not None else '전체 채널'
+        query=urlencode({k:v for k,v in [('start',filters['start']),('end',filters['end']),('tenant_id',filters['tenant_id'] or ''),('channel_id',filters['channel_id'] or '')] if v})
+        tenant_opts=''.join(f'<option value="{r["id"]}"{" selected" if r["id"]==filters["tenant_id"] else ""}>{esc(r["name"])}</option>' for r in filters['tenants'])
+        channel_opts=''.join(f'<option value="{r["id"]}"{" selected" if r["id"]==filters["channel_id"] else ""}>{esc(r["name"])}</option>' for r in filters['channels'])
+        tenant_filter='' if user['role']=='tenant' else f'<label>업체<select name="tenant_id"><option value="">전체 업체</option>{tenant_opts}</select></label>'
+        stats=''.join(f'<article class="card"><small>{label}</small><strong>{value}</strong></article>' for label,value in [('판매 결제액',won(totals['sales_amount'] or 0)),('환불액',won(totals['refund_amount'] or 0)),('취소액',won(totals['cancel_amount'] or 0)),('순매출 · 결제 기준',won(totals['net_amount'] or 0)),('순판매 수량',f'{totals["net_quantity"] or 0:,}개')])
+        include_tenant=user['role']!='tenant'
+        item_rows_list=[]
+        for r in items:
+            cols=[f'<td>{esc(r["tenant"])}</td>'] if include_tenant else []
+            cols.extend([f'<td>{esc(r["channel"])}</td>',f'<td>{esc(r["product"])}</td>',f'<td class="right">{r["sales_count"]:,}</td>',f'<td class="right">{r["sold_quantity"]:,}</td>',f'<td class="right">{r["returned_quantity"]:,}</td>',f'<td class="right">{r["net_quantity"]:,}</td>',f'<td class="right">{won(r["sales_amount"])}</td>',f'<td class="right">{won(r["refund_amount"])}</td>',f'<td class="right">{won(r["cancel_amount"])}</td>',f'<td class="right"><b>{won(r["net_amount"])}</b></td>',f'<td class="right">{won(r["supply_amount"])}</td>'])
+            item_rows_list.append('<tr>'+''.join(cols)+'</tr>')
+        item_rows=''.join(item_rows_list)
+        if not item_rows:item_rows=f'<tr><td colspan="{12 if include_tenant else 11}">선택한 기간에 매출 자료가 없습니다.</td></tr>'
+        def period_rows(rows):
+            return ''.join(f'<tr><td>{esc(r["period"])}</td><td class="right">{r["sales_count"]:,}</td><td class="right">{r["reversals_count"]:,}</td><td class="right">{r["sold_quantity"]:,}</td><td class="right">{r["returned_quantity"]:,}</td><td class="right">{r["net_quantity"]:,}</td><td class="right">{won(r["sales_amount"])}</td><td class="right">{won(r["refund_amount"])}</td><td class="right">{won(r["cancel_amount"])}</td><td class="right"><b>{won(r["net_amount"])}</b></td><td class="right">{won(r["supply_amount"])}</td></tr>' for r in rows) or '<tr><td colspan="11">선택한 기간에 매출 자료가 없습니다.</td></tr>'
+        title_columns='<th>업체</th>' if include_tenant else ''
+        item_table=f'<section class="panel report-section"><h2>품목별 판매현황</h2><div class="tablewrap"><table class="report-table"><thead><tr>{title_columns}<th>채널</th><th>품목</th><th>매출 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{item_rows}</tbody></table></div></section>'
+        daily_table=f'<section class="panel report-section"><h2>일자별 매출총계</h2><div class="tablewrap"><table class="report-table"><thead><tr><th>일자</th><th>매출 건</th><th>환불·취소 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{period_rows(daily)}</tbody></table></div></section>'
+        monthly_table=f'<section class="panel report-section"><h2>월간 매출합계</h2><div class="tablewrap"><table class="report-table"><thead><tr><th>월</th><th>매출 건</th><th>환불·취소 건</th><th>판매 수량</th><th>환불·취소 수량</th><th>순수량</th><th>결제액</th><th>환불액</th><th>취소액</th><th>순매출</th><th>공급가액 순액</th></tr></thead><tbody>{period_rows(monthly)}</tbody></table></div></section>'
+        body=f'''<div class="report-page"><div class="row report-controls"><div><h1>매출 보고서</h1><div class="sub">품목·일자·월별 집계를 같은 조회 조건으로 확인합니다.</div></div><div class="report-actions"><button class="btn" type="button" onclick="window.print()">인쇄 · PDF 저장</button><a class="btn" href="/reports/items.csv?{query}">품목별 CSV</a><a class="btn" href="/reports/daily.csv?{query}">일자별 CSV</a><a class="btn" href="/reports/monthly.csv?{query}">월간 CSV</a></div></div><section class="panel report-controls"><form class="report-filters" method="get" action="/reports"><label>시작일<input type="date" name="start" value="{filters['start']}" required></label><label>종료일<input type="date" name="end" value="{filters['end']}" required></label>{tenant_filter}<label>채널<select name="channel_id"><option value="">전체 채널</option>{channel_opts}</select></label><button class="btn primary">조회</button><span class="small">{esc(tenant_label)} · {esc(channel_label)}</span></form></section><div class="report-stats">{stats}</div><p class="print-only">조회 기간: {filters['start']} ~ {filters['end']} · 업체: {esc(tenant_label)} · 채널: {esc(channel_label)} · 출력 기준일: {today_kst().isoformat()}</p>{item_table}{daily_table}{monthly_table}<div class="report-note">집계 기준: 결제액은 매출 이벤트에 기록된 실제 결제금액(할인 반영 후)입니다. 환불·취소는 원장에 저장된 음수 금액을 합산해 별도로 표시하고 순매출에 반영합니다. 공급가액 순액은 면세업체는 결제 순액, 과세·혼합 업체는 입력된 상품 세액을 뺀 금액입니다. 품목 수량은 새로 기록한 거래에서 입력한 수량을 쓰며, 과거 수량 정보가 없던 거래는 1개로 간주됩니다.</div></div>'''
+        return page('매출 보고서',body,user,'reports',csrf)
+    def sales(self,user,csrf):
+        with conn() as c:
+            q='SELECT s.*,t.name tenant,ch.name channel FROM sale_events s JOIN tenants t ON t.id=s.tenant_id JOIN channels ch ON ch.id=s.channel_id';a=()
+            if user['role']=='tenant':q+=' WHERE s.tenant_id=?';a=(user['tenant_id'],)
+            rows=c.execute(q+' ORDER BY s.occurred_on DESC,s.id DESC LIMIT 500',a).fetchall()
+            tenants=c.execute('SELECT id,name FROM tenants WHERE active=1'+(' AND id=?' if user['role']=='tenant' else ''),((user['tenant_id'],) if user['role']=='tenant' else ())).fetchall()
+            channels=c.execute('SELECT id,name FROM channels WHERE active=1').fetchall()
+        tenant_opts=''.join(f'<option value="{t["id"]}">{esc(t["name"])}</option>' for t in tenants);ch_opts=''.join(f'<option value="{x["id"]}">{esc(x["name"])}</option>' for x in channels)
+        can=user['role'] in ('admin','finance')
+        add=f'''<section class="panel"><h2>거래 직접 등록</h2><form method="post" action="/sales/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>입점업체</label><select name="tenant_id" required>{tenant_opts}</select></div><div><label>판매 채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>주문번호</label><input name="order_id" required maxlength="120"></div><div><label>유형</label><select name="event_type"><option value="sale">매출</option><option value="refund">환불</option><option value="cancel">취소</option></select></div><div><label>발생일</label><input type="date" name="occurred_on" value="{today_kst().isoformat()}" required></div><div><label>실결제/환불액 (원)</label><input type="number" min="0" name="gross_amount" required></div><div><label>수량 (개)</label><input type="number" min="1" step="1" name="quantity" value="1" required></div><div><label>이 거래의 상품 부가세 (원)</label><input type="number" min="0" name="tax_amount" placeholder="과세 업체는 자동 계산 · 혼합과세는 입력"></div><div><label>상품</label><input name="product"></div><div><label>결제수단</label><input name="payment_method"></div><div><label>정산 참조번호</label><input name="settlement_ref"></div></div><p class="small">환불·취소 금액과 수량은 양수로 입력합니다. 원장에는 음수로 기록합니다.</p><button class="btn primary">원장에 추가</button></form></section>''' if can else ''
+        import_form=f'''<section class="panel"><h2>매출 CSV 가져오기</h2><form method="post" action="/sales/import" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>채널</label><select name="channel_id" required>{ch_opts}</select></div><div><label>CSV 파일</label><input type="file" name="file" accept=".csv,text/csv" required></div></div><p class="small">필수 열: event_id,order_id,event_type,date,tenant,amount,tax_amount. 선택 열: quantity,discount,product,payment_method,settlement_ref. quantity 생략 시 1개로 기록합니다. UTF-8 CSV, 6MB 이하.</p><button class="btn">검증 후 가져오기</button></form></section>''' if can else ''
+        rows_html=''.join(self.sale_row(r) for r in rows) or '<tr><td colspan="10">거래 자료가 없습니다.</td></tr>'
+        return page('매출 원장',f'<div class="row"><div><h1>매출 원장</h1><div class="sub">매출·환불·수량을 변경 불가능한 거래 이벤트로 기록합니다.</div></div><div class="report-actions"><a class="btn" href="/reports">매출 보고서</a><a class="btn" href="/sales.csv">CSV 내려받기</a></div></div>{add}{import_form}<section class="panel"><h2>최근 거래 · 최대 500건</h2><div class="tablewrap"><table>{self.sale_head()}<tbody>{rows_html}</tbody></table></div></section>',user,'sales',csrf)
+    def reconcile(self,user,csrf):
+        self.require(user,'admin','finance')
+        with conn() as c:
+            q='SELECT p.*,ch.name channel FROM payout_records p JOIN channels ch ON ch.id=p.channel_id';a=()
+            if user['role']=='tenant':q+=' WHERE p.channel_id IN (SELECT channel_id FROM sale_events WHERE tenant_id=?)';a=(user['tenant_id'],)
+            rows=c.execute(q+' ORDER BY p.settlement_date DESC,p.id DESC LIMIT 500',a).fetchall();chs=c.execute('SELECT id,name FROM channels WHERE active=1').fetchall()
+        can=user['role'] in ('admin','finance'); chopts=''.join(f'<option value="{x["id"]}">{esc(x["name"])}</option>' for x in chs)
+        f=f'''<section class="panel"><h2>정산 묶음 직접 등록</h2><form method="post" action="/reconcile/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>채널</label><select name="channel_id">{chopts}</select></div><div><label>정산 참조번호</label><input name="settlement_ref" required></div><div><label>정산일</label><input type="date" name="settlement_date" value="{today_kst().isoformat()}" required></div><div><label>예상 입금액</label><input type="number" min="0" name="expected_amount" value="0"></div><div><label>실제 입금액</label><input type="number" min="0" name="received_amount" value="0"></div><div><label>PG·카드 수수료</label><input type="number" min="0" name="provider_fee" value="0"></div><div><label>은행 참조번호</label><input name="bank_ref"></div></div><button class="btn primary">대사 자료 기록</button></form><div class="spacer"></div><h2>정산 CSV 가져오기</h2><form method="post" action="/reconcile/import" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>채널</label><select name="channel_id">{chopts}</select></div><div><label>CSV 파일</label><input type="file" name="file" accept=".csv,text/csv" required></div></div><p class="small">필수 열: settlement_ref,settlement_date,expected_amount,received_amount. 선택 열: provider_fee,bank_ref.</p><button class="btn">정산 CSV 가져오기</button></form></section>''' if can else ''
+        tbl=''.join(f'<tr><td>{esc(r["settlement_date"])}</td><td>{esc(r["settlement_ref"])}</td><td>{esc(r["channel"])}</td><td class="right">{won(r["expected_amount"])}</td><td class="right">{won(r["received_amount"])}</td><td class="right">{won(r["provider_fee"])}</td><td class="right">{won(r["expected_amount"]-r["received_amount"])}</td><td><span class="badge {"" if r["expected_amount"]==r["received_amount"] else "warn"}">{"대사완료" if r["expected_amount"]==r["received_amount"] else "확인필요"}</span></td></tr>' for r in rows)
+        return page('입금 대사',f'<div class="row"><div><h1>입금 대사</h1><div class="sub">정산 묶음 단위로 예상액·실입금·수수료 차이를 대조합니다.</div></div><a class="btn" href="/payouts.csv">CSV 내려받기</a></div>{f}<section class="panel"><h2>대사 내역</h2><div class="tablewrap"><table><thead><tr><th>정산일</th><th>정산 참조</th><th>채널</th><th>예정액</th><th>실입금</th><th>결제 수수료</th><th>차액</th><th>상태</th></tr></thead><tbody>{tbl or "<tr><td colspan=8>정산 자료가 없습니다.</td></tr>"}</tbody></table></div></section><div class="note">카드·PG 입금은 여러 주문이 한 번에 입금될 수 있으므로 주문 단위가 아닌 정산 참조번호·정산 묶음으로 대사합니다.</div>',user,'reconcile',csrf)
+    def settlements(self,user,csrf,selected_period=None):
+        period=selected_period or today_kst().strftime('%Y-%m')
+        with conn() as c:
+            q='SELECT st.*,t.name tenant FROM statements st JOIN tenants t ON t.id=st.tenant_id WHERE st.period=?';args=[period]
+            if user['role']=='tenant':q+=' AND st.tenant_id=?';args.append(user['tenant_id'])
+            rows=c.execute(q+' ORDER BY t.name',args).fetchall();ts=c.execute('SELECT id,name FROM tenants WHERE active=1'+(' AND id=?' if user['role']=='tenant' else ''),((user['tenant_id'],) if user['role']=='tenant' else ())).fetchall()
+        opts=''.join(f'<option value="{t["id"]}">{esc(t["name"])}</option>' for t in ts);gen=f'<section class="panel"><h2>월 정산 스냅샷 생성</h2><form class="inline" method="post" action="/settlements/generate"><input type="hidden" name="csrf" value="{esc(csrf)}"><label>정산월 <input type="month" name="period" value="{period}" required></label><label>업체 <select name="tenant_id"><option value="">전체 업체</option>{opts}</select></label><button class="btn primary">정산 생성</button></form><p class="small">한 번 생성된 명세는 고정됩니다. 이후 환불·정정은 다음 정산 기간의 조정 거래로 반영하세요.</p></section>' if user['role'] in ('admin','finance') else ''
+        rowshtml=''.join(f'<tr><td>{esc(r["period"])}</td><td>{esc(r["tenant"])}</td><td>{r["fee_rate"]}%</td><td class="right">{won(r["basis_amount"])}</td><td class="right">{won(r["fee_amount"])}</td><td class="right">{won(r["vat_amount"])}</td><td class="right"><b>{won(r["total_amount"])}</b></td><td><span class="badge {"" if r["status"]=="paid" else "warn"}">{"수납완료" if r["status"]=="paid" else "발행"}</span></td><td>{esc(r["generated_at"][:10])}</td><td>{f'<form method="post" action="/settlements/paid"><input type="hidden" name="csrf" value="{esc(csrf)}"><input type="hidden" name="statement_id" value="{r["id"]}"><button class="btn">수납 처리</button></form>' if user["role"] in ("admin","finance") and r["status"]!="paid" else "—"}</td></tr>' for r in rows)
+        picker=f'<form class="inline" method="get" action="/settlements"><label>조회 월 <input type="month" name="period" value="{esc(period)}" required></label><button class="btn">조회</button></form>'
+        return page('수수료 정산',f'<div class="row"><div><h1>수수료 정산</h1><div class="sub">계약 수수료율과 매출 이벤트를 기준으로 잠금형 월별 명세를 생성합니다.</div></div><a class="btn" href="/statements.csv">정산 내역 CSV</a></div>{picker}{gen}<section class="panel"><h2>{period} 명세</h2><div class="tablewrap"><table><thead><tr><th>기간</th><th>업체</th><th>율</th><th>수수료 기준액</th><th>수수료</th><th>수수료 부가세</th><th>청구액</th><th>상태</th><th>생성일</th><th>처리</th></tr></thead><tbody>{rowshtml or "<tr><td colspan=10>해당 월에 생성된 정산 명세가 없습니다.</td></tr>"}</tbody></table></div></section><div class="note">공급가액 기준 수수료에 부가세 10% 별도 부과. 과세 거래의 상품 부가세는 거래 입력 시 함께 기록해야 합니다. 면세 입점업체는 업체 설정의 면세 구분을 따릅니다.</div>',user,'settlements',csrf)
+    def connectors_page(self,user,csrf):
+        self.require(user,'admin','finance')
+        path=os.path.join(ROOT,'connectors','catalog.json')
+        try:
+            with open(path,encoding='utf-8') as f:catalog=json.load(f)
+        except (OSError,json.JSONDecodeError):
+            raise ValueError('연동 카탈로그를 읽을 수 없습니다. 배포 파일에 connectors/catalog.json이 포함되었는지 확인하세요.')
+        cards=[]
+        for item in catalog.get('connectors',[]):
+            needs=''.join(f'<li>{esc(x)}</li>' for x in item.get('partner_inputs',[]))
+            cards.append(f'<section class="panel"><div class="row"><h2>{esc(item.get("name"))}</h2><span class="badge warn">{esc(item.get("readiness"))}</span></div><p>{esc(item.get("purpose"))}</p><p class="small">자료가 연결될 위치: <code>{esc(item.get("target"))}</code> · 현재 방식: {esc(item.get("current_mode"))}</p><details><summary>업체와 확인할 내용</summary><ul>{needs}</ul></details></section>')
+        body='<div class="row"><div><h1>아르카온 · 연동 준비</h1><div class="sub">업체 사양을 받으면 이 표준에 맞춰 공급사별 연결기를 구현합니다.</div></div></div><div class="note">자동 API 연동은 아직 켜져 있지 않습니다. 공식 문서·판매자 동의·샌드박스 확인 전에는 CSV 방식으로 운영하세요. 비밀키는 이 앱이나 저장소에 입력하지 않습니다.</div><section class="panel"><h2>공통 처리 순서</h2><p>업체 원본 ID와 원자료를 유지 → 표준 매출/정산 형식으로 변환 → 중복 검사 → 화면에서 합계 대조 → 승인된 자료만 원장에 기록</p><p class="small">계약과 API 사양, 테스트 결과를 확인한 뒤 운영자가 업체별 연결 사용을 승인해야 합니다.</p></section>'+''.join(cards)
+        return page('연동 준비',body,user,'connectors',csrf)
+    def arkaon_analysis(self,user,csrf):
+        period=today_kst().strftime('%Y-%m')
+        first=dt.date.fromisoformat(period+'-01');next_month=(first.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+        with conn() as c:
+            clauses='WHERE e.occurred_on>=? AND e.occurred_on<?';args=[first.isoformat(),next_month.isoformat()]
+            if user['role']=='tenant':clauses+=' AND e.tenant_id=?';args.append(user['tenant_id'])
+            total=c.execute(f'SELECT COUNT(*) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM sale_events e {clauses}',args).fetchone()
+            tenant_rows=[]
+            if user['role']!='tenant':
+                tenant_rows=c.execute('SELECT t.name,t.fee_rate,t.vat_mode,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM tenants t LEFT JOIN sale_events e ON e.tenant_id=t.id AND e.occurred_on>=? AND e.occurred_on<? WHERE t.active=1 GROUP BY t.id ORDER BY gross DESC,t.name',(first.isoformat(),next_month.isoformat())).fetchall()
+            else:
+                tenant_rows=c.execute('SELECT t.name,t.fee_rate,t.vat_mode,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross,COALESCE(SUM(e.tax_amount),0) tax FROM tenants t LEFT JOIN sale_events e ON e.tenant_id=t.id AND e.occurred_on>=? AND e.occurred_on<? WHERE t.id=? GROUP BY t.id',(first.isoformat(),next_month.isoformat(),user['tenant_id'])).fetchall()
+            channel_sql='SELECT ch.name,COUNT(e.id) n,COALESCE(SUM(e.gross_amount),0) gross FROM channels ch LEFT JOIN sale_events e ON e.channel_id=ch.id AND e.occurred_on>=? AND e.occurred_on<?'+(' AND e.tenant_id=?' if user['role']=='tenant' else '')+' WHERE ch.active=1 GROUP BY ch.id ORDER BY gross DESC,ch.name'
+            channel_args=(first.isoformat(),next_month.isoformat())+((user['tenant_id'],) if user['role']=='tenant' else ())
+            channel_rows=c.execute(channel_sql,channel_args).fetchall()
+            mismatch=[];bad_tax=[];unlinked=[]
+            if user['role']!='tenant':
+                mismatch=c.execute('SELECT settlement_ref,settlement_date,expected_amount,received_amount,channel_id FROM payout_records WHERE expected_amount<>received_amount ORDER BY settlement_date DESC LIMIT 20').fetchall()
+                bad_tax=c.execute('SELECT e.order_id,e.occurred_on,e.gross_amount,e.tax_amount,t.name tenant FROM sale_events e JOIN tenants t ON t.id=e.tenant_id WHERE ABS(e.tax_amount)>ABS(e.gross_amount) ORDER BY e.id DESC LIMIT 20').fetchall()
+                unlinked=c.execute("SELECT p.settlement_ref,p.settlement_date,ch.name channel FROM payout_records p JOIN channels ch ON ch.id=p.channel_id WHERE NOT EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=p.channel_id AND e.settlement_ref=p.settlement_ref) ORDER BY p.settlement_date DESC LIMIT 20").fetchall()
+                no_sales=c.execute('SELECT ch.name FROM channels ch WHERE ch.active=1 AND NOT EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=ch.id AND e.occurred_on>=? AND e.occurred_on<?)',(first.isoformat(),next_month.isoformat())).fetchall()
+                no_sales=[r['name'] for r in no_sales]
+            else:
+                mismatch=[];bad_tax=[];unlinked=[];no_sales=[]
+        gross=int(total['gross']);tax=int(total['tax'])
+        fee=sum(round((int(r['gross']) if r['vat_mode']=='exempt' else int(r['gross'])-int(r['tax']))*float(r['fee_rate'])/100) for r in tenant_rows)
+        metrics=''.join(f'<div class="card metric"><small>{esc(k)}</small><strong>{esc(v)}</strong></div>' for k,v in [('조회 기간',period),('원장 거래 건수',f'{total["n"]:,}건'),('결제·환불 순액',won(gross)),('현재 입력 기준 수수료 참고액',won(fee))])
+        table=''.join(f'<tr><td>{esc(r["name"])}</td><td>{r["n"]:,}</td><td class="right">{won(r["gross"])}</td><td class="right">{won(r["tax"])}</td></tr>' for r in tenant_rows)
+        channels=''.join(f'<tr><td>{esc(r["name"])}</td><td>{r["n"]:,}</td><td class="right">{won(r["gross"])}</td></tr>' for r in channel_rows)
+        alerts=[]
+        for r in mismatch:alerts.append(f'<li><b>입금 차이 확인:</b> {esc(r["settlement_ref"])} · 예정 {won(r["expected_amount"])} / 실제 {won(r["received_amount"])} · {esc(r["settlement_date"])}</li>')
+        for r in unlinked:alerts.append(f'<li><b>참조번호 확인:</b> 정산 {esc(r["settlement_ref"])}가 매출 원장 거래에 연결되지 않습니다. 매출 자료에 참조번호를 넣지 않는 업체라면 참고만 하세요.</li>')
+        for r in bad_tax:alerts.append(f'<li><b>세액 확인:</b> {esc(r["tenant"])} 주문 {esc(r["order_id"])}의 상품 세액이 결제액보다 큽니다.</li>')
+        for name in no_sales:alerts.append(f'<li><b>자료 수집 확인:</b> {esc(name)} 채널에 이번 달 원장 자료가 없습니다. 판매가 없었던 것인지 업로드가 빠졌는지 확인하세요.</li>')
+        if any((int(r['gross']) if r['vat_mode']=='exempt' else int(r['gross'])-int(r['tax']))<0 for r in tenant_rows):alerts.append('<li><b>환불 이월 검토:</b> 조회 기간의 환불·취소가 매출보다 커 수수료 기준액이 음수입니다. 정산 담당자가 계약상 이월 처리 방법을 확인해야 합니다.</li>')
+        alert_body=''.join(alerts) or '<li>현재 규칙으로 확인할 항목이 없습니다. 원본 POS·판매·은행 자료와 등록 합계를 계속 대조하세요.</li>'
+        review=f'<section class="panel"><h2>입점업체별 합계</h2><div class="tablewrap"><table><thead><tr><th>업체</th><th>원장 건수</th><th>결제·환불 순액</th><th>상품 세액</th></tr></thead><tbody>{table}</tbody></table></div></section>' if user['role']!='tenant' else ''
+        body=f'<div class="row"><div><h1>아르카온 관리·분석</h1><div class="sub">원장에 등록된 숫자를 읽어 운영자가 확인할 항목을 정리합니다. 자동 추정이 아니라 근거가 보이는 규칙 분석입니다.</div></div><a class="btn" href="/sales.csv">내 매출 자료</a></div><div class="cards">{metrics}</div><section class="panel"><h2>확인할 항목</h2><ul>{alert_body}</ul></section>{review}<section class="panel"><h2>채널별 자료 현황</h2><div class="tablewrap"><table><thead><tr><th>채널</th><th>원장 건수</th><th>결제·환불 순액</th></tr></thead><tbody>{channels}</tbody></table></div></section><div class="note">분석은 현재 DB에 들어온 자료만 사용합니다. 채널에 매출이 없다고 해서 누락을 확정하지 않으며, 계약별 수수료 기준과 세무 판단을 대신하지 않습니다. ‘현재 입력 기준 수수료 참고액’은 월 명세서와 구분해 확인하세요.</div>'
+        return page('아르카온 분석',body,user,'arkaon',csrf)
+    def tenants(self,user,csrf):
+        self.require(user,'admin','finance')
+        with conn() as c:rows=c.execute('SELECT * FROM tenants ORDER BY id DESC').fetchall()
+        form=f'''<section class="panel"><h2>입점업체 등록</h2><form method="post" action="/tenants/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><div class="formgrid"><div><label>업체명</label><input name="name" required></div><div><label>사업자번호</label><input name="business_no"></div><div><label>담당자</label><input name="manager"></div><div><label>연락처</label><input name="phone"></div><div><label>수수료율(%)</label><input type="number" name="fee_rate" min="0" max="100" step="0.01" value="10" required></div><div><label>상품 과세</label><select name="vat_mode"><option value="taxable">과세</option><option value="exempt">면세</option><option value="mixed">혼합·거래별 세액 입력</option></select></div><div><label>정산 계좌(마스킹 권장)</label><input name="bank_account"></div></div><button class="btn primary">업체 저장</button></form></section>'''
+        users=('<div class="note">사용자 계정은 서버 명령으로 개설합니다: python app.py create-user 아이디 --role tenant --tenant-id 업체ID</div>' if user['role']=='admin' else '')
+        return page('입점업체',form+users+'<section class="panel"><h2>등록 업체</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>업체</th><th>담당자</th><th>사업자번호</th><th>수수료율</th><th>과세</th><th>정산계좌</th></tr></thead><tbody>'+''.join(f'<tr><td>{r["id"]}</td><td>{esc(r["name"])}</td><td>{esc(r["manager"])}</td><td>{esc(r["business_no"])}</td><td>{r["fee_rate"]}%</td><td>{esc(r["vat_mode"])}</td><td>{esc(r["bank_account"])}</td></tr>' for r in rows)+'</tbody></table></div></section>',user,'tenants',csrf)
+    def channels(self,user,csrf):
+        self.require(user,'admin','finance')
+        with conn() as c:rows=c.execute('SELECT * FROM channels ORDER BY id DESC').fetchall()
+        form=f'''<section class="panel"><h2>판매 채널 등록</h2><form class="inline" method="post" action="/channels/add"><input type="hidden" name="csrf" value="{esc(csrf)}"><label>채널명 <input name="name" required></label><label>유형 <select name="channel_type"><option>POS</option><option>LIVE</option><option>ONLINE</option><option>CASH</option><option>OTHER</option></select></label><label>자료 수집 방식 <select name="ingest_mode"><option value="csv">CSV 업로드</option><option value="manual">직접 등록</option><option value="api_pending">API 연동 예정</option></select></label><button class="btn primary">채널 저장</button></form></section>'''
+        return page('판매 채널',form+'<section class="panel"><h2>등록 채널</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>채널명</th><th>유형</th><th>자료 수집</th><th>활성</th></tr></thead><tbody>'+''.join(f'<tr><td>{r["id"]}</td><td>{esc(r["name"])}</td><td>{esc(r["channel_type"])}</td><td>{esc(r["ingest_mode"])}</td><td>{"활성" if r["active"] else "중지"}</td></tr>' for r in rows)+'</tbody></table></div></section>',user,'channels',csrf)
+    def audit_page(self,user,csrf):
+        self.require(user,'admin')
+        with conn() as c:rows=c.execute('SELECT a.*,u.username FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 300').fetchall()
+        tbl=''.join(f'<tr><td>{esc(r["created_at"])}</td><td>{esc(r["username"] or "system")}</td><td>{esc(r["action"])}</td><td>{esc(r["object_type"])} #{esc(r["object_id"])}</td><td><code>{esc(r["detail_json"])}</code></td></tr>' for r in rows)
+        return page('감사 이력',f'<h1>감사 이력</h1><div class="sub">최근 300건의 사용자·재무 데이터 변경 이력</div><section class="panel"><div class="tablewrap"><table><thead><tr><th>일시</th><th>사용자</th><th>행위</th><th>대상</th><th>상세</th></tr></thead><tbody>{tbl}</tbody></table></div></section>',user,'dashboard',csrf)
+    def post(self,path,d,user,start,csrf):
+        if path=='/sales/add':
+            self.require(user,'admin','finance')
+            with conn() as c:
+                tenant=c.execute('SELECT * FROM tenants WHERE id=? AND active=1',(int(d['tenant_id']),)).fetchone();channel=c.execute('SELECT * FROM channels WHERE id=? AND active=1',(int(d['channel_id']),)).fetchone()
+                if not tenant or not channel:raise ValueError('업체 또는 판매 채널을 확인해 주세요.')
+                event_type=d.get('event_type','sale');gross=self.integer(d,'gross_amount');discount=self.integer(d,'discount_amount',0);quantity=self.integer(d,'quantity',1)
+                if quantity<1:raise ValueError('판매 수량은 1개 이상 입력해 주세요.')
+                tax_value=d.get('tax_amount','').strip()
+                tax=self.integer(d,'tax_amount') if tax_value else (round(gross/11) if tenant['vat_mode']=='taxable' else 0)
+                if tenant['vat_mode']=='mixed' and not tax_value:raise ValueError('혼합 과세 업체는 거래별 상품 부가세를 입력해야 합니다.')
+                if event_type in ('refund','cancel'):gross=-gross;tax=-tax;discount=-discount;quantity=-quantity
+                key=str(uuid.uuid4());self.insert_event(c,tenant,channel,key,d['order_id'],event_type,d['occurred_on'],d.get('product',''),gross,discount,tax,d.get('payment_method',''),d.get('settlement_ref',''),None,user['id'],quantity);audit(c,user['id'],'sale_event.append',event_type,key,{'order_id':d['order_id'],'amount':gross,'quantity':quantity})
+            return self.redirect(start,'/sales')
+        if path=='/sales/import':return self.import_sales(d,user,start)
+        if path=='/reconcile/add':
+            self.require(user,'admin','finance')
+            with conn() as c:
+                ch=c.execute('SELECT * FROM channels WHERE id=?',(int(d['channel_id']),)).fetchone()
+                if not ch:raise ValueError('채널을 확인해 주세요.')
+                vals=(ch['id'],d['settlement_ref'],d['settlement_date'],self.integer(d,'expected_amount'),self.integer(d,'received_amount'),self.integer(d,'provider_fee',0),d.get('bank_ref',''),user['id'],now_iso())
+                cur=c.execute('INSERT INTO payout_records(channel_id,settlement_ref,settlement_date,expected_amount,received_amount,provider_fee,bank_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)',vals);audit(c,user['id'],'payout.create','payout',cur.lastrowid,{'settlement_ref':d['settlement_ref'],'expected':vals[3],'received':vals[4]})
+            return self.redirect(start,'/reconcile')
+        if path=='/reconcile/import':return self.import_payouts(d,user,start)
+        if path=='/tenants/add':
+            self.require(user,'admin','finance')
+            rate=float(d.get('fee_rate','10'))
+            if not 0<=rate<=100:raise ValueError('수수료율은 0~100% 범위로 입력해 주세요.')
+            with conn() as c:
+                cur=c.execute('INSERT INTO tenants(name,business_no,manager,phone,fee_rate,vat_mode,bank_account,created_at) VALUES(?,?,?,?,?,?,?,?)',(d['name'].strip(),d.get('business_no',''),d.get('manager',''),d.get('phone',''),f'{rate:.2f}',d.get('vat_mode','taxable'),d.get('bank_account',''),now_iso()));audit(c,user['id'],'tenant.create','tenant',cur.lastrowid,{'name':d['name'],'fee_rate':rate,'vat_mode':d.get('vat_mode')})
+            return self.redirect(start,'/tenants')
+        if path=='/channels/add':
+            self.require(user,'admin','finance')
+            with conn() as c:
+                cur=c.execute('INSERT INTO channels(name,channel_type,ingest_mode,created_at) VALUES(?,?,?,?)',(d['name'].strip(),d.get('channel_type','OTHER'),d.get('ingest_mode','csv'),now_iso()));audit(c,user['id'],'channel.create','channel',cur.lastrowid,{'name':d['name'],'type':d.get('channel_type')})
+            return self.redirect(start,'/channels')
+        if path=='/settlements/generate':
+            self.require(user,'admin','finance')
+            period=d.get('period','')
+            try:startdate=dt.date.fromisoformat(period+'-01');enddate=(startdate.replace(day=28)+dt.timedelta(days=4)).replace(day=1)
+            except ValueError:raise ValueError('정산월 형식은 YYYY-MM이어야 합니다.')
+            with conn() as c:
+                c.execute('BEGIN IMMEDIATE')
+                q='SELECT * FROM tenants WHERE active=1';args=[]
+                if d.get('tenant_id'):q+=' AND id=?';args.append(int(d['tenant_id']))
+                tenants=c.execute(q,args).fetchall();made=0
+                for t in tenants:
+                    if c.execute('SELECT 1 FROM statements WHERE tenant_id=? AND period=?',(t['id'],period)).fetchone():continue
+                    evs=c.execute('SELECT * FROM sale_events WHERE tenant_id=? AND occurred_on>=? AND occurred_on<? ORDER BY id',(t['id'],startdate.isoformat(),enddate.isoformat())).fetchall()
+                    basis=0
+                    for ev in evs:
+                        taxable=(ev['gross_amount']-ev['tax_amount']) if t['vat_mode']!='exempt' else ev['gross_amount']
+                        basis+=taxable
+                    if not evs:continue
+                    if basis<0:raise ValueError(f'{t["name"]}의 {period} 환불액이 매출액을 초과했습니다. 이월 환불 조정을 먼저 확정해 주세요.')
+                    rate=float(t['fee_rate']);fee=round(basis*rate/100);vat=round(fee*VAT_RATE/100)
+                    cur=c.execute('INSERT INTO statements(tenant_id,period,fee_rate,basis_amount,fee_amount,vat_amount,total_amount,status,generated_by,generated_at) VALUES(?,?,?,?,?,?,?,"issued",?,?)',(t['id'],period,t['fee_rate'],basis,fee,vat,fee+vat,user['id'],now_iso()))
+                    c.executemany('INSERT INTO statement_lines(statement_id,sale_event_id,included_amount) VALUES(?,?,?)',[(cur.lastrowid,e['id'],e['gross_amount']-e['tax_amount'] if t['vat_mode']!='exempt' else e['gross_amount']) for e in evs]);audit(c,user['id'],'statement.generate','statement',cur.lastrowid,{'period':period,'tenant_id':t['id'],'basis':basis,'fee':fee,'vat':vat});made+=1
+            return self.redirect(start,'/settlements')
+        if path=='/settlements/paid':
+            self.require(user,'admin','finance');sid=int(d['statement_id'])
+            with conn() as c:
+                c.execute('BEGIN IMMEDIATE');r=c.execute('SELECT * FROM statements WHERE id=?',(sid,)).fetchone()
+                if not r:raise ValueError('정산 명세를 찾을 수 없습니다.')
+                if r['status']!='paid':c.execute('UPDATE statements SET status="paid",paid_at=? WHERE id=?',(now_iso(),sid));audit(c,user['id'],'statement.paid','statement',sid,{'amount':r['total_amount']})
+            return self.redirect(start,'/settlements')
+        return self.error(start,'404 Not Found','요청한 작업을 찾지 못했습니다.',user,csrf)
+    @staticmethod
+    def integer(d,key,default=None):
+        value=d.get(key,'')
+        if value=='' and default is not None:return default
+        try:n=int(str(value).replace(',','').strip())
+        except Exception:raise ValueError(f'{key} 금액은 원 단위 정수로 입력해 주세요.')
+        if n<0:raise ValueError(f'{key} 금액은 음수일 수 없습니다.')
+        return n
+    @staticmethod
+    def insert_event(c,tenant,channel,event_key,order_id,event_type,on,product,gross,discount,tax,payment,settlement,batch,user,quantity=1):
+        if event_type not in ('sale','refund','cancel'):raise ValueError('event_type은 sale/refund/cancel 중 하나여야 합니다.')
+        try:dt.date.fromisoformat(on)
+        except ValueError:raise ValueError('발생일은 YYYY-MM-DD 형식이어야 합니다.')
+        if event_type=='sale' and (gross<0 or tax<0):raise ValueError('매출 이벤트 금액은 0 이상이어야 합니다.')
+        if event_type in ('refund','cancel') and (gross>0 or tax>0):raise ValueError('환불·취소 이벤트는 원장에 음수로 기록해야 합니다.')
+        if not isinstance(quantity,int) or quantity==0:raise ValueError('판매 수량은 0이 아닌 정수여야 합니다.')
+        if event_type=='sale' and quantity<0:raise ValueError('매출 수량은 양수여야 합니다.')
+        if event_type in ('refund','cancel') and quantity>0:raise ValueError('환불·취소 수량은 원장에 음수로 기록해야 합니다.')
+        c.execute('INSERT INTO sale_events(tenant_id,channel_id,event_key,order_id,event_type,occurred_on,product,quantity,gross_amount,discount_amount,tax_amount,payment_method,settlement_ref,import_batch_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(tenant['id'],channel['id'],event_key,order_id,event_type,on,product,quantity,gross,discount,tax,payment,settlement,batch,user,now_iso()))
+    def import_sales(self,d,user,start):
+        self.require(user,'admin','finance');raw=d.get('file','');filename=d.get('file_filename','upload.csv')
+        if not raw:raise ValueError('CSV 파일을 선택해 주세요.')
+        payload=raw.encode('utf-8');fhash=hashlib.sha256(payload).hexdigest();channel_id=int(d.get('channel_id','0'))
+        try:reader=csv.DictReader(io.StringIO(raw));required={'event_id','order_id','event_type','date','tenant','amount','tax_amount'}
+        except Exception as e:raise ValueError(f'CSV를 읽지 못했습니다: {e}')
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):raise ValueError('필수 CSV 열이 없습니다: '+', '.join(sorted(required)))
+        parsed=[];errs=[]
+        with conn() as c:
+            channel=c.execute('SELECT * FROM channels WHERE id=?',(channel_id,)).fetchone()
+            if not channel:raise ValueError('판매 채널을 확인해 주세요.')
+            for i,row in enumerate(reader,start=2):
+                try:
+                    tenant=c.execute('SELECT * FROM tenants WHERE name=? AND active=1',(row['tenant'].strip(),)).fetchone()
+                    if not tenant:raise ValueError('입점업체 이름이 등록되지 않았습니다.')
+                    typ=row['event_type'].strip().lower();typ={'sale':'sale','매출':'sale','refund':'refund','환불':'refund','cancel':'cancel','취소':'cancel'}.get(typ)
+                    if not typ:raise ValueError('event_type은 sale/refund/cancel입니다.')
+                    amount=int(row['amount'].replace(',','').strip());tax_raw=(row.get('tax_amount') or '').replace(',','').strip();tax=int(tax_raw) if tax_raw else (round(amount/11) if tenant['vat_mode']=='taxable' else 0);discount=int((row.get('discount') or '0').replace(',','').strip());quantity=int((row.get('quantity') or '1').replace(',','').strip())
+                    if tenant['vat_mode']=='mixed' and not tax_raw:raise ValueError('혼합 과세 업체는 tax_amount가 필요합니다.')
+                    if amount<0 or tax<0 or discount<0 or quantity<1:raise ValueError('CSV 금액은 양수, 수량은 1 이상이어야 합니다.')
+                    if typ in ('refund','cancel'):amount=-amount;tax=-tax;discount=-discount;quantity=-quantity
+                    on=row['date'].strip();dt.date.fromisoformat(on)
+                    parsed.append((tenant,channel,row['event_id'].strip(),row['order_id'].strip(),typ,on,row.get('product',''),quantity,amount,discount,tax,row.get('payment_method',''),row.get('settlement_ref','')))
+                except Exception as e:errs.append(f'{i}행: {e}')
+            if errs:raise ValueError('CSV 검증 실패 — 아무 행도 저장하지 않았습니다. '+' / '.join(errs[:8]))
+            if c.execute('SELECT 1 FROM import_batches WHERE kind="sales" AND file_hash=?',(fhash,)).fetchone():raise ValueError('같은 파일을 이미 가져왔습니다.')
+            c.execute('BEGIN IMMEDIATE');cur=c.execute('INSERT INTO import_batches(kind,filename,file_hash,imported_by,row_count,duplicate_count,created_at) VALUES("sales",?,?,?,?,0,?)',(filename,fhash,user['id'],len(parsed),now_iso()));batch=cur.lastrowid;inserted=0;dupes=0
+            for item in parsed:
+                tenant,ch,event_id,order_id,typ,on,product,quantity,amount,discount,tax,payment,settlement=item
+                if not event_id:event_id=hashlib.sha256(json.dumps(item[2:],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+                try:self.insert_event(c,tenant,ch,event_id,order_id,typ,on,product,amount,discount,tax,payment,settlement,batch,user['id'],quantity);inserted+=1
+                except sqlite3.IntegrityError:
+                    dupes+=1
+            c.execute('UPDATE import_batches SET row_count=?,duplicate_count=? WHERE id=?',(inserted,dupes,batch));audit(c,user['id'],'sales.import','import_batch',batch,{'filename':filename,'rows':inserted,'duplicates':dupes,'sha256':fhash})
+        return self.redirect(start,'/sales')
+    def import_payouts(self,d,user,start):
+        self.require(user,'admin','finance');raw=d.get('file','');filename=d.get('file_filename','payout.csv')
+        if not raw:raise ValueError('정산 CSV 파일을 선택해 주세요.')
+        channel_id=int(d.get('channel_id','0'));fhash=hashlib.sha256(raw.encode()).hexdigest()
+        reader=csv.DictReader(io.StringIO(raw));required={'settlement_ref','settlement_date','expected_amount','received_amount'}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):raise ValueError('필수 열: '+', '.join(sorted(required)))
+        parsed=[]
+        for i,r in enumerate(reader,start=2):
+            try:
+                dt.date.fromisoformat(r['settlement_date']);vals=[int((r.get(k) or '0').replace(',','').strip()) for k in ('expected_amount','received_amount','provider_fee')]
+                if min(vals)<0:raise ValueError('금액은 음수일 수 없습니다.')
+                parsed.append((r['settlement_ref'].strip(),r['settlement_date'].strip(),*vals,r.get('bank_ref','').strip()))
+            except Exception as e:raise ValueError(f'{i}행 검증 오류: {e}; 아무 자료도 저장하지 않았습니다.')
+        with conn() as c:
+            ch=c.execute('SELECT * FROM channels WHERE id=?',(channel_id,)).fetchone()
+            if not ch:raise ValueError('채널을 확인해 주세요.')
+            if c.execute('SELECT 1 FROM import_batches WHERE kind="payout" AND file_hash=?',(fhash,)).fetchone():raise ValueError('같은 파일을 이미 가져왔습니다.')
+            c.execute('BEGIN IMMEDIATE');cur=c.execute('INSERT INTO import_batches(kind,filename,file_hash,imported_by,row_count,duplicate_count,created_at) VALUES("payout",?,?,?,?,0,?)',(filename,fhash,user['id'],len(parsed),now_iso()));batch=cur.lastrowid;added=0
+            for ref,date,expected,received,fee,bank in parsed:
+                c.execute('INSERT OR IGNORE INTO payout_records(channel_id,settlement_ref,settlement_date,expected_amount,received_amount,provider_fee,bank_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(channel_id,ref,date,expected,received,fee,bank,user['id'],now_iso()));added+=c.execute('SELECT changes()').fetchone()[0]
+            audit(c,user['id'],'payout.import','import_batch',batch,{'filename':filename,'rows':added,'input_rows':len(parsed),'sha256':fhash})
+        return self.redirect(start,'/reconcile')
+    def redirect(self,start,path):start('303 See Other',[('Location',path),('Cache-Control','no-store')]);return [b'']
+    def csv_response(self,start,rows,filename):
+        safe_rows=[[("'"+v) if isinstance(v,str) and v[:1] in ('=','+','-','@','\t','\r') else v for v in row] for row in rows]
+        buf=io.StringIO(newline='');w=csv.writer(buf);w.writerows(safe_rows);data='\ufeff'+buf.getvalue();return self.respond(start,'200 OK',data,[('Content-Type','text/csv; charset=utf-8'),('Content-Disposition',f'attachment; filename="{filename}"')])
+    def get_csv(self,path,user,start,query_string=''):
+        if path=='/payouts.csv': self.require(user,'admin','finance')
+        if path in ('/reports/items.csv','/reports/daily.csv','/reports/monthly.csv'):
+            filters=self.report_filters(user,query_string)
+            _,items,daily,monthly=self.report_data(filters)
+            if path.endswith('/items.csv'):
+                headers=['tenant','channel','product','sales_events','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+                item_columns=['tenant','channel','product','sales_count','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+                rows=[[r[k] for k in item_columns] for r in items]
+                return self.csv_response(start,[headers,*rows],'item-sales-report.csv')
+            periods=daily if path.endswith('/daily.csv') else monthly
+            headers=['period','sales_events','reversal_events','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+            period_columns=['period','sales_count','reversals_count','sold_quantity','returned_quantity','net_quantity','sales_amount','refund_amount','cancel_amount','net_amount','supply_amount','tax_amount','discount_amount']
+            rows=[[r[k] for k in period_columns] for r in periods]
+            filename='daily-sales-report.csv' if path.endswith('/daily.csv') else 'monthly-sales-report.csv'
+            return self.csv_response(start,[headers,*rows],filename)
+        with conn() as c:
+            if path=='/sales.csv':
+                q='SELECT e.event_key,e.order_id,e.event_type,e.occurred_on,t.name,ch.name,e.product,e.quantity,e.gross_amount,e.discount_amount,e.tax_amount,e.payment_method,e.settlement_ref FROM sale_events e JOIN tenants t ON t.id=e.tenant_id JOIN channels ch ON ch.id=e.channel_id';a=()
+                if user['role']=='tenant':q+=' WHERE e.tenant_id=?';a=(user['tenant_id'],)
+                rows=c.execute(q+' ORDER BY e.id',a).fetchall();return self.csv_response(start,[['event_id','order_id','event_type','date','tenant','channel','product','quantity','amount','discount','tax_amount','payment_method','settlement_ref'],*[list(r) for r in rows]],'sales-ledger.csv')
+            if path=='/payouts.csv':
+                q='SELECT p.settlement_ref,p.settlement_date,ch.name,p.expected_amount,p.received_amount,p.provider_fee,p.bank_ref FROM payout_records p JOIN channels ch ON ch.id=p.channel_id';a=()
+                if user['role']=='tenant':q+=' WHERE EXISTS (SELECT 1 FROM sale_events e WHERE e.channel_id=p.channel_id AND e.tenant_id=?)';a=(user['tenant_id'],)
+                rows=c.execute(q+' ORDER BY p.settlement_date',a).fetchall();return self.csv_response(start,[['settlement_ref','settlement_date','channel','expected_amount','received_amount','provider_fee','bank_ref'],*[list(r) for r in rows]],'payout-reconciliation.csv')
+            q='SELECT st.period,t.name,st.fee_rate,st.basis_amount,st.fee_amount,st.vat_amount,st.total_amount,st.status FROM statements st JOIN tenants t ON t.id=st.tenant_id';a=()
+            if user['role']=='tenant':q+=' WHERE st.tenant_id=?';a=(user['tenant_id'],)
+            rows=c.execute(q+' ORDER BY st.period,t.name',a).fetchall();return self.csv_response(start,[['period','tenant','fee_rate','basis_amount','fee_amount','vat_amount','total_amount','status'],*[list(r) for r in rows]],'commission-statements.csv')
+
+def main():
+    parser=argparse.ArgumentParser(description='누리온 세일즈허브 · 아세아홀딩스 매출·수수료 운영 원장')
+    sub=parser.add_subparsers(dest='command',required=True)
+    sub.add_parser('init-db',help='데이터베이스 초기화')
+    u=sub.add_parser('create-user',help='관리자·정산담당·입점업체 사용자 생성');u.add_argument('username');u.add_argument('--role',choices=('admin','finance','tenant'),default='admin');u.add_argument('--tenant-id',type=int)
+    srv=sub.add_parser('serve',help='내장 WSGI 서버 실행');srv.add_argument('--host',default=os.environ.get('HOST','127.0.0.1'));srv.add_argument('--port',type=int,default=int(os.environ.get('PORT','8000')))
+    backup=sub.add_parser('backup',help='SQLite 온라인 백업');backup.add_argument('--output',required=True)
+    args=parser.parse_args();init_db()
+    if args.command=='init-db':print(f'Database ready: {DB_PATH}');return
+    if args.command=='create-user':
+        import getpass
+        password=getpass.getpass('새 비밀번호(12자 이상): ');confirm=getpass.getpass('비밀번호 확인: ')
+        if password!=confirm:raise SystemExit('비밀번호가 일치하지 않습니다.')
+        create_user(args.username,password,args.role,args.tenant_id);print(f'사용자 {args.username} 생성 완료 ({args.role})');return
+    if args.command=='backup':
+        output=os.path.abspath(args.output);os.makedirs(os.path.dirname(output),exist_ok=True)
+        with conn() as source, sqlite3.connect(output) as target: source.backup(target)
+        print(f'Backup created: {output}');return
+    if args.command=='serve':
+        app=App();print(f'누리온 세일즈허브 실행: http://{args.host}:{args.port} (데이터: {DB_PATH})')
+        with make_server(args.host,args.port,app) as server:server.serve_forever()
+
+def bootstrap_first_admin():
+    username=os.environ.get('BOOTSTRAP_ADMIN_USERNAME','').strip()
+    password=os.environ.get('BOOTSTRAP_ADMIN_PASSWORD','')
+    if not username or not password:return
+    with conn() as c:
+        exists=c.execute('SELECT 1 FROM users LIMIT 1').fetchone()
+    if not exists:
+        create_user(username,password,'admin')
+        print(f'Bootstrap administrator created: {username}')
+
+bootstrap_first_admin()
+application=App()
+if __name__=='__main__':main()

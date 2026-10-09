@@ -1,0 +1,49 @@
+{
+  "schema_version": "addon-polo.connector-catalog/v1",
+  "contract_version": "addon-polo.canonical-events/v1",
+  "note": "Provider names, endpoints, credentials, and signatures are intentionally unset until authorized partner specifications are received.",
+  "connectors": [
+    {
+      "id": "venue-pos",
+      "name": "매장 공용 POS / VAN",
+      "purpose": "매장 주문·결제·취소를 판매 원장으로 가져옵니다.",
+      "target": "sale_events",
+      "current_mode": "manual_or_csv",
+      "readiness": "CSV 운영 가능 · POS사 협의 대기",
+      "partner_inputs": ["거래내역 API 또는 정기 CSV", "고유 거래 ID", "취소·부분환불 구분", "상품세액 또는 과세구분", "정산 참조번호", "개발/샌드박스 계정"]
+    },
+    {
+      "id": "commerce-live",
+      "name": "온라인몰 / 라이브커머스",
+      "purpose": "주문·결제확정·취소·환불을 판매 원장으로 가져옵니다.",
+      "target": "sale_events",
+      "current_mode": "manual_or_csv",
+      "readiness": "CSV 운영 가능 · 판매채널별 권한 및 API 협의 대기",
+      "partner_inputs": ["판매자 동의 및 공식 API 승인", "주문/결제/환불 상태표", "실결제액·할인·상품세액", "페이지 조회 커서 또는 웹훅 재시도 규칙", "샌드박스 주문"]
+    },
+    {
+      "id": "pg-card-settlement",
+      "name": "PG / 카드 정산",
+      "purpose": "정산 묶음별 입금 예정액과 결제 수수료를 가져옵니다.",
+      "target": "payout_records.expected_amount",
+      "current_mode": "manual_or_csv",
+      "readiness": "정산 CSV 운영 가능 · 사업자/가맹점 권한 확인 대기",
+      "partner_inputs": ["가맹점 정산 API 또는 정산 CSV", "정산 참조번호", "정산일·지급예정액·수수료", "취소 차감 시점", "조회 범위와 지연 갱신 규칙"]
+    },
+    {
+      "id": "bank-deposit",
+      "name": "은행 입금 내역",
+      "purpose": "통장 실제 입금액과 은행 거래 참조번호를 대사에 사용합니다.",
+      "target": "operator-reviewed match to payout_records",
+      "current_mode": "manual_or_csv",
+      "readiness": "정산 CSV 운영 가능 · 은행 기업 API 권한 협의 대기",
+      "partner_inputs": ["기업 계좌 조회 API 또는 은행이 제공하는 파일", "계좌 소유자 동의와 읽기전용 권한", "거래 고유번호·거래일·입금액", "정산 참조번호 연결 방법 또는 운영자 확인 절차", "토큰 만료·재인증 절차", "은행 모의/테스트 환경"]
+    }
+  ],
+  "security_defaults": {
+    "store_provider_passwords_in_app": false,
+    "credentials_source": "deployment_secret_manager_or_environment",
+    "automatic_money_movement": false,
+    "production_enable_requires": ["official_partner_documentation", "seller_or_account_owner_authorization", "sandbox_test_evidence", "idempotency_and_replay_test", "operator_acceptance"]
+  }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+<title id="title">누리온 세일즈허브 로고</title><desc id="desc">거래 흐름을 상징하는 N 형태 심볼</desc>
+<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#344b63"/><stop offset="1" stop-color="#26384d"/></linearGradient><linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#b3f1e2"/><stop offset="1" stop-color="#91b4eb"/></linearGradient></defs>
+<rect x="2" y="2" width="60" height="60" rx="18" fill="url(#bg)"/>
+<path d="M19 46V18l26 28V18" fill="none" stroke="#f7fafc" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M19 50h26" stroke="url(#stroke)" stroke-width="3" stroke-linecap="round" opacity=".9"/>
+</svg>
